@@ -9,6 +9,7 @@ fixed GPS time: the rotation of the Earth during the signal is neglected.
 At that time the latitude equals the declination and the longitude is the
 right ascension minus the Greenwich mean sidereal time.
 """
+
 import itertools
 from dataclasses import dataclass, field
 
@@ -23,7 +24,9 @@ from ..geometry import get_polarization_tensor
 from ..time import greenwich_mean_sidereal_time
 
 
-def get_antenna_patterns_at_zero_polarization(interferometers, latitude, longitude, time):
+def get_antenna_patterns_at_zero_polarization(
+    interferometers, latitude, longitude, time
+):
     """
     Return the plus and cross antenna patterns at polarization zero.
 
@@ -45,13 +48,25 @@ def get_antenna_patterns_at_zero_polarization(interferometers, latitude, longitu
     """
     right_ascension = np.asarray(longitude) + greenwich_mean_sidereal_time(time)
     polarization_tensors = [
-        get_polarization_tensor(np.ravel(right_ascension), np.ravel(latitude), time, 0.0, mode)
-        for mode in ["plus", "cross"]]
-    antenna_patterns = np.array([
-        [np.einsum("ij,ij...->...", interferometer.geometry.detector_tensor, tensor)
-         for tensor in polarization_tensors]
-        for interferometer in interferometers])
-    return np.moveaxis(antenna_patterns, -1, 0).reshape(np.shape(latitude) + antenna_patterns.shape[:2])
+        get_polarization_tensor(
+            np.ravel(right_ascension), np.ravel(latitude), time, 0.0, mode
+        )
+        for mode in ["plus", "cross"]
+    ]
+    antenna_patterns = np.array(
+        [
+            [
+                np.einsum(
+                    "ij,ij...->...", interferometer.geometry.detector_tensor, tensor
+                )
+                for tensor in polarization_tensors
+            ]
+            for interferometer in interferometers
+        ]
+    )
+    return np.moveaxis(antenna_patterns, -1, 0).reshape(
+        np.shape(latitude) + antenna_patterns.shape[:2]
+    )
 
 
 def get_geocenter_delays(interferometers, latitude, longitude):
@@ -74,9 +89,13 @@ def get_geocenter_delays(interferometers, latitude, longitude):
         the shape of :code:`latitude`.
     """
     latitude, longitude = np.asarray(latitude), np.asarray(longitude)
-    direction = np.array([np.cos(latitude) * np.cos(longitude),
-                          np.cos(latitude) * np.sin(longitude),
-                          np.sin(latitude)])
+    direction = np.array(
+        [
+            np.cos(latitude) * np.cos(longitude),
+            np.cos(latitude) * np.sin(longitude),
+            np.sin(latitude),
+        ]
+    )
     vertices = np.array([interferometer.vertex for interferometer in interferometers])
     return -np.einsum("di,i...->d...", vertices, direction) / speed_of_light
 
@@ -102,8 +121,13 @@ def rotate_antenna_patterns(antenna_patterns, psi):
     cos_two_psi = np.cos(2 * np.asarray(psi))[..., np.newaxis]
     sin_two_psi = np.sin(2 * np.asarray(psi))[..., np.newaxis]
     plus, cross = antenna_patterns[..., 0], antenna_patterns[..., 1]
-    return np.stack([cos_two_psi * plus + sin_two_psi * cross,
-                     -sin_two_psi * plus + cos_two_psi * cross], axis=-1)
+    return np.stack(
+        [
+            cos_two_psi * plus + sin_two_psi * cross,
+            -sin_two_psi * plus + cos_two_psi * cross,
+        ],
+        axis=-1,
+    )
 
 
 def exp_normalize(log_probability, axis=-1):
@@ -111,7 +135,9 @@ def exp_normalize(log_probability, axis=-1):
     Return probabilities normalized to sum to one along :code:`axis`, from
     unnormalized log probabilities, as cogwheel's :code:`utils.exp_normalize`.
     """
-    probability = np.exp(log_probability - np.max(log_probability, axis=axis, keepdims=True))
+    probability = np.exp(
+        log_probability - np.max(log_probability, axis=axis, keepdims=True)
+    )
     return probability / np.sum(probability, axis=axis, keepdims=True)
 
 
@@ -154,10 +180,15 @@ class SkyDictionary:
         Maps each cell, a tuple of rounded delays in units of
         :code:`1 / f_sampling`, to an array of sky indices.
     """
-    DEFAULT_F_SAMPLING = 2 ** 13
 
-    def __init__(self, interferometers, *, f_sampling=DEFAULT_F_SAMPLING, nsky=10 ** 6, seed=0):
-        self.detector_names = tuple(interferometer.name for interferometer in interferometers)
+    DEFAULT_F_SAMPLING = 2**13
+
+    def __init__(
+        self, interferometers, *, f_sampling=DEFAULT_F_SAMPLING, nsky=10**6, seed=0
+    ):
+        self.detector_names = tuple(
+            interferometer.name for interferometer in interferometers
+        )
         self.nsky = nsky
         self.f_sampling = f_sampling
         self.seed = seed
@@ -166,8 +197,11 @@ class SkyDictionary:
         self.sky_samples = self._create_sky_samples()
         # In Earth-fixed coordinates the antenna patterns do not depend on time; any GPS time gives the same values
         self.fplus_fcross_0 = get_antenna_patterns_at_zero_polarization(
-            interferometers, self.sky_samples["lat"], self.sky_samples["lon"], 0.0).astype(np.float32)
-        geocenter_delays = get_geocenter_delays(interferometers, self.sky_samples["lat"], self.sky_samples["lon"])
+            interferometers, self.sky_samples["lat"], self.sky_samples["lon"], 0.0
+        ).astype(np.float32)
+        geocenter_delays = get_geocenter_delays(
+            interferometers, self.sky_samples["lat"], self.sky_samples["lon"]
+        )
         self.geocenter_delay_first_det = geocenter_delays[0]
         self.delays = geocenter_delays[1:] - geocenter_delays[0]
 
@@ -186,14 +220,26 @@ class SkyDictionary:
         self._delays_prior = dict()
         weights = np.linalg.norm(self.fplus_fcross_0, axis=(1, 2)) ** 3
         for number in range(2, len(self.detector_names) + 1):
-            for order in itertools.permutations(range(len(self.detector_names)), number):
-                pairwise_delays = self._discretize(geocenter_delays[order[1:], ] - geocenter_delays[order[0]])
-                bins = [np.arange(*bounds) + .5 for bounds in zip(
-                    pairwise_delays.min(axis=1) - 1, pairwise_delays.max(axis=1) + 1)]
+            for order in itertools.permutations(
+                range(len(self.detector_names)), number
+            ):
+                pairwise_delays = self._discretize(
+                    geocenter_delays[order[1:],] - geocenter_delays[order[0]]
+                )
+                bins = [
+                    np.arange(*bounds) + 0.5
+                    for bounds in zip(
+                        pairwise_delays.min(axis=1) - 1, pairwise_delays.max(axis=1) + 1
+                    )
+                ]
                 self._delays_prior[order] = np.histogramdd(
-                    pairwise_delays.T, weights=weights, bins=bins)[0].copy("F")
+                    pairwise_delays.T, weights=weights, bins=bins
+                )[0].copy("F")
                 if number == 2:
-                    self._delays_bounds[order] = (pairwise_delays.min(), pairwise_delays.max())
+                    self._delays_bounds[order] = (
+                        pairwise_delays.min(),
+                        pairwise_delays.max(),
+                    )
 
         # An array over cells of iterators that cycle through each cell's sky indices
         self._ind_generators = np.full(self._max_delay - self._min_delay + 1, iter(()))
@@ -237,15 +283,19 @@ class SkyDictionary:
         """
         shape = [1 for _ in timeseries.shape]
         shape[axis] = timeseries.shape[axis]
-        window = np.sqrt(scipy.signal.windows.tukey(shape[axis], .1)).reshape(shape)
+        window = np.sqrt(scipy.signal.windows.tukey(shape[axis], 0.1)).reshape(shape)
         endpoint = np.mean(timeseries.take([0, -1], axis), axis, keepdims=True)
         timeseries = (timeseries - endpoint) * window + endpoint
 
         ratio = np.round(self.f_sampling * (times[1] - times[0]), decimals=10)
         if ratio != 1:
-            timeseries, times = scipy.signal.resample(timeseries, int(len(times) * ratio), times, axis=axis)
+            timeseries, times = scipy.signal.resample(
+                timeseries, int(len(times) * ratio), times, axis=axis
+            )
             if not np.isclose(1 / self.f_sampling, times[1] - times[0]):
-                raise ValueError("The spacing of `times` is incommensurate with `f_sampling`.")
+                raise ValueError(
+                    "The spacing of `times` is incommensurate with `f_sampling`."
+                )
         return timeseries, times
 
     def get_sky_inds_and_prior(self, delays):
@@ -274,10 +324,14 @@ class SkyDictionary:
         """
         if len(self.detector_names) == 1:
             number = delays.shape[1]
-            sky_inds = np.fromiter(itertools.islice(self._ind_generators[()], number), int, number)
+            sky_inds = np.fromiter(
+                itertools.islice(self._ind_generators[()], number), int, number
+            )
             return sky_inds, np.full(number, self._sky_prior), np.full(number, True)
 
-        physical_mask = np.all((delays.T >= self._min_delay) & (delays.T <= self._max_delay), axis=1)
+        physical_mask = np.all(
+            (delays.T >= self._min_delay) & (delays.T <= self._max_delay), axis=1
+        )
         sky_prior = self._sky_prior[tuple(delays[:, physical_mask])]
         submask = sky_prior > 0
         physical_mask[physical_mask] *= submask
@@ -305,10 +359,15 @@ class SkyDictionary:
         """Return the map from each cell, a tuple of rounded delays, to the indices of its sky locations."""
         if len(self.detector_names) == 1:
             return {(): np.arange(self.nsky)}
-        keys, inverse = np.unique(self._discretize(self.delays).T, axis=0, return_inverse=True)
+        keys, inverse = np.unique(
+            self._discretize(self.delays).T, axis=0, return_inverse=True
+        )
         order = np.argsort(inverse.ravel(), kind="stable")
         groups = np.split(order, np.cumsum(np.bincount(inverse.ravel()))[:-1])
-        return {tuple(int(value) for value in key): group for key, group in zip(keys, groups)}
+        return {
+            tuple(int(value) for value in key): group
+            for key, group in zip(keys, groups)
+        }
 
     def _discretize(self, delays):
         """Return delays (s) rounded to integer multiples of 1 / f_sampling."""
@@ -330,14 +389,20 @@ class SkyDictionary:
         det_order = tuple(np.argsort(t_arrival_lnprob.max(axis=1)))[::-1]
         if len(det_order) > 1:
             prob_t0 = exp_normalize(t_arrival_lnprob[det_order[0]])
-            t_arrival_lnprob[det_order[1]] += self._second_detector_lnprior(det_order, prob_t0)
+            t_arrival_lnprob[det_order[1]] += self._second_detector_lnprior(
+                det_order, prob_t0
+            )
         if len(det_order) > 2:
             prob_t1 = exp_normalize(t_arrival_lnprob[det_order[1]])
-            t_arrival_lnprob[det_order[2]] += self._third_detector_lnprior(det_order, prob_t0, prob_t1)
+            t_arrival_lnprob[det_order[2]] += self._third_detector_lnprior(
+                det_order, prob_t0, prob_t1
+            )
 
     def _second_detector_lnprior(self, det_order, prob_t0):
         """Log prior of the arrival time at the second interferometer given that at the first (Eq. 37)."""
-        prior_t1 = scipy.signal.convolve(prob_t0, self._delays_prior[det_order[:2]], "same")
+        prior_t1 = scipy.signal.convolve(
+            prob_t0, self._delays_prior[det_order[:2]], "same"
+        )
         return np.log(prior_t1 + 1e-10)
 
     def _third_detector_lnprior(self, det_order, prob_t0, prob_t1):
@@ -355,8 +420,8 @@ def n_effective(weights):
     """The effective sample size, :math:`(\\sum w)^2 / \\sum w^2`, as cogwheel's :code:`utils.n_effective`."""
     weights = np.asarray(weights)
     if weights.size == 0:
-        return 0.
-    return np.sum(weights) ** 2 / np.sum(weights ** 2)
+        return 0.0
+    return np.sum(weights) ** 2 / np.sum(weights**2)
 
 
 @dataclass
@@ -419,6 +484,7 @@ class MarginalizationInfo:
         Log of the likelihood marginalized over the extrinsic parameters;
         :code:`-inf` if no pair is kept.
     """
+
     qmc_sequence_id: int
     ln_numerators: np.ndarray
     q_inds: np.ndarray
@@ -444,15 +510,19 @@ class MarginalizationInfo:
         if self.q_inds.size == 0:
             self.weights = np.array([])
             self.weights_q = np.array([])
-            self.n_effective = 0.
+            self.n_effective = 0.0
             self.lnl_marginalized = -np.inf
             return
         denominators = np.zeros(len(self.q_inds))
         for n_qmc, proposal in zip(self.proposals_n_qmc, self.proposals):
-            denominators += n_qmc * np.prod(np.take_along_axis(proposal, self.tdet_inds, axis=1), axis=0)
+            denominators += n_qmc * np.prod(
+                np.take_along_axis(proposal, self.tdet_inds, axis=1), axis=0
+            )
         ln_weights = self.ln_numerators - np.log(denominators)
         self.weights = exp_normalize(ln_weights)
-        weights_q = np.bincount(self.q_inds, weights=self.weights)  # the phases of each sample summed
+        weights_q = np.bincount(
+            self.q_inds, weights=self.weights
+        )  # the phases of each sample summed
         self.weights_q = weights_q[weights_q > 0]
         self.n_effective = n_effective(self.weights_q)
         self.lnl_marginalized = logsumexp(ln_weights)
@@ -467,9 +537,24 @@ class MarginalizationInfo:
             raise ValueError("Cannot use different QMC sequences.")
         self.proposals_n_qmc = self.proposals_n_qmc + other.proposals_n_qmc
         self.proposals = self.proposals + other.proposals
-        for attribute in ("ln_numerators", "q_inds", "o_inds", "sky_inds", "t_first_det", "d_h", "h_h",
-                          "tdet_inds", "flip_psi"):
-            setattr(self, attribute, np.concatenate([getattr(self, attribute), getattr(other, attribute)], axis=-1))
+        for attribute in (
+            "ln_numerators",
+            "q_inds",
+            "o_inds",
+            "sky_inds",
+            "t_first_det",
+            "d_h",
+            "h_h",
+            "tdet_inds",
+            "flip_psi",
+        ):
+            setattr(
+                self,
+                attribute,
+                np.concatenate(
+                    [getattr(self, attribute), getattr(other, attribute)], axis=-1
+                ),
+            )
         self.__post_init__()
 
 
@@ -554,15 +639,32 @@ class CoherentScore:
     (:code:`lnlike_marginalized_over_distance`).
     """
 
-    def __init__(self, sky_dict, m_arr, lnlike_marginalized_over_distance, nphi=128, dlnl_threshold=12.,
-                 beta_temperature=0.5, learning_rate=1e-2, log2n_qmc=11, max_log2n_qmc=15, n_qmc_sequences=128,
-                 seed=0, min_n_effective=50, ln_time_prior=None):
+    def __init__(
+        self,
+        sky_dict,
+        m_arr,
+        lnlike_marginalized_over_distance,
+        nphi=128,
+        dlnl_threshold=12.0,
+        beta_temperature=0.5,
+        learning_rate=1e-2,
+        log2n_qmc=11,
+        max_log2n_qmc=15,
+        n_qmc_sequences=128,
+        seed=0,
+        min_n_effective=50,
+        ln_time_prior=None,
+    ):
         if max_log2n_qmc < log2n_qmc:
             raise ValueError("max_log2n_qmc < log2n_qmc")
         self.sky_dict = sky_dict
         self.m_arr = np.asarray(m_arr)
         self.m_inds, self.mprime_inds = (
-            np.array(indices) for indices in zip(*itertools.combinations_with_replacement(range(len(self.m_arr)), 2)))
+            np.array(indices)
+            for indices in zip(
+                *itertools.combinations_with_replacement(range(len(self.m_arr)), 2)
+            )
+        )
         self.lnlike_marginalized_over_distance = lnlike_marginalized_over_distance
         self.nphi = nphi
         self.dlnl_threshold = dlnl_threshold
@@ -578,7 +680,10 @@ class CoherentScore:
         self._current_qmc_sequence_id = 0
         # The QMC sequences need the interferometers, so they are made only with a sky dictionary
         self._qmc_sequences = (
-            [] if sky_dict is None else [self._create_qmc_sequence() for _ in range(n_qmc_sequences)])
+            []
+            if sky_dict is None
+            else [self._create_qmc_sequence() for _ in range(n_qmc_sequences)]
+        )
         self._qmc_ind_chunks = self._create_qmc_ind_chunks()
 
     @property
@@ -597,7 +702,12 @@ class CoherentScore:
         self._nphi = nphi
         self.phi_ref = np.linspace(0, 2 * np.pi, nphi, endpoint=False)
         self._dh_phasor = np.exp(-1j * np.outer(self.m_arr, self.phi_ref))
-        self._hh_phasor = np.exp(1j * np.outer(self.m_arr[self.m_inds] - self.m_arr[self.mprime_inds], self.phi_ref))
+        self._hh_phasor = np.exp(
+            1j
+            * np.outer(
+                self.m_arr[self.m_inds] - self.m_arr[self.mprime_inds], self.phi_ref
+            )
+        )
 
     def get_dh_hh_qo(self, fplus_fcross, dh_dmpq, hh_mppd):
         """
@@ -657,11 +767,14 @@ class CoherentScore:
             used when drawing samples, as in cogwheel.
         """
         flip_psi = np.signbit(dh_qo)
-        max_over_distance_lnl = 0.5 * dh_qo ** 2 / hh_qo
+        max_over_distance_lnl = 0.5 * dh_qo**2 / hh_qo
         threshold = np.max(max_over_distance_lnl) - self.dlnl_threshold
         important = np.where(max_over_distance_lnl > threshold)
-        ln_numerators = (self.lnlike_marginalized_over_distance(dh_qo[important], hh_qo[important])
-                         + np.log(sky_prior[important[0]]) - np.log(self.nphi))
+        ln_numerators = (
+            self.lnlike_marginalized_over_distance(dh_qo[important], hh_qo[important])
+            + np.log(sky_prior[important[0]])
+            - np.log(self.nphi)
+        )
         return ln_numerators, important, flip_psi[important]
 
     def incoherent_t_arrival_lnprob(self, dh_mptd, hh_mppd):
@@ -688,9 +801,12 @@ class CoherentScore:
         array_like
             Of shape (interferometer, time).
         """
-        hh_mpdiagonal = hh_mppd[np.equal(self.m_inds, self.mprime_inds)][:, (0, 1), (0, 1)].real  # mpd
-        chi_squared = (np.einsum("mptd->td", np.abs(dh_mptd)) ** 2
-                       / np.einsum("mpd->d", hh_mpdiagonal))
+        hh_mpdiagonal = hh_mppd[np.equal(self.m_inds, self.mprime_inds)][
+            :, (0, 1), (0, 1)
+        ].real  # mpd
+        chi_squared = np.einsum("mptd->td", np.abs(dh_mptd)) ** 2 / np.einsum(
+            "mpd->d", hh_mpdiagonal
+        )
         return (self.beta_temperature / 2 * chi_squared).T
 
     def get_t_arrival_proposal(self, dh_mptd, hh_mppd):
@@ -725,7 +841,9 @@ class CoherentScore:
             if self._t_arrival_prob.shape == t_arrival_prob.shape:
                 t_arrival_prob = 0.5 * (t_arrival_prob + self._t_arrival_prob)
             else:
-                logger.warning("The length of the time series changed, resetting the arrival-time proposal.")
+                logger.warning(
+                    "The length of the time series changed, resetting the arrival-time proposal."
+                )
                 self._t_arrival_prob = None
         return t_arrival_prob
 
@@ -762,7 +880,10 @@ class CoherentScore:
         cell of width :code:`1 / f_sampling` (s) and the polarization (rad).
         """
         dt = 1 / self.sky_dict.f_sampling
-        return dict.fromkeys(self.sky_dict.detector_names, (0, 1)) | {"t_fine": (-dt / 2, dt / 2), "psi": (0, np.pi)}
+        return dict.fromkeys(self.sky_dict.detector_names, (0, 1)) | {
+            "t_fine": (-dt / 2, dt / 2),
+            "psi": (0, np.pi),
+        }
 
     def _create_qmc_sequence(self):
         """
@@ -775,21 +896,28 @@ class CoherentScore:
         :code:`psi`.
         """
         sequence_values = qmc.scale(
-            qmc.Halton(len(self._qmc_range_dic), seed=self._rng).random(2 ** self.max_log2n_qmc) % 1,  # 1 -> 0
-            *zip(*self._qmc_range_dic.values())).T
+            qmc.Halton(len(self._qmc_range_dic), seed=self._rng).random(
+                2**self.max_log2n_qmc
+            )
+            % 1,  # 1 -> 0
+            *zip(*self._qmc_range_dic.values()),
+        ).T
         n_det = len(self.sky_dict.detector_names)
-        qmc_sequence = dict(zip(list(self._qmc_range_dic)[n_det:], sequence_values[n_det:]),
-                            u_tdet=sequence_values[:n_det])
+        qmc_sequence = dict(
+            zip(list(self._qmc_range_dic)[n_det:], sequence_values[n_det:]),
+            u_tdet=sequence_values[:n_det],
+        )
         sintwopsi = np.sin(2 * qmc_sequence["psi"])
         costwopsi = np.cos(2 * qmc_sequence["psi"])
         qmc_sequence["rot_psi"] = np.moveaxis(
-            [[costwopsi, sintwopsi], [-sintwopsi, costwopsi]], -1, 0).astype(np.float32)
+            [[costwopsi, sintwopsi], [-sintwopsi, costwopsi]], -1, 0
+        ).astype(np.float32)
         return qmc_sequence
 
     def _create_qmc_ind_chunks(self):
         """The indices of a QMC sequence, split into chunks of :code:`2 ** log2n_qmc`."""
-        qmc_inds = np.arange(2 ** self.max_log2n_qmc)
-        breaks = np.arange(2 ** self.log2n_qmc, 2 ** self.max_log2n_qmc, 2 ** self.log2n_qmc)
+        qmc_inds = np.arange(2**self.max_log2n_qmc)
+        breaks = np.arange(2**self.log2n_qmc, 2**self.max_log2n_qmc, 2**self.log2n_qmc)
         return np.split(qmc_inds, breaks)
 
     @property
@@ -834,8 +962,14 @@ class CoherentScore:
         """
         cumprob = np.cumsum(t_arrival_prob, axis=1)
         np.testing.assert_allclose(cumprob[:, -1], 1)
-        return np.array([np.searchsorted(cumulative, u)
-                         for cumulative, u in zip(cumprob, self._qmc_sequence["u_tdet"][:, q_inds])])
+        return np.array(
+            [
+                np.searchsorted(cumulative, u)
+                for cumulative, u in zip(
+                    cumprob, self._qmc_sequence["u_tdet"][:, q_inds]
+                )
+            ]
+        )
 
     def draw_extrinsic_samples(self, t_arrival_prob, times, i_chunk):
         """
@@ -872,13 +1006,22 @@ class CoherentScore:
         q_inds = self._qmc_ind_chunks[i_chunk]
         n_qmc = len(q_inds)
         tdet_inds = self.get_tdet_inds(t_arrival_prob, q_inds)
-        sky_inds, sky_prior, physical_mask = self.sky_dict.get_sky_inds_and_prior(tdet_inds[1:] - tdet_inds[0])
+        sky_inds, sky_prior, physical_mask = self.sky_dict.get_sky_inds_and_prior(
+            tdet_inds[1:] - tdet_inds[0]
+        )
         q_inds = q_inds[physical_mask]
         tdet_inds = tdet_inds[:, physical_mask]
         t_first_det = times[tdet_inds[0]] + self._qmc_sequence["t_fine"][q_inds]
-        return dict(n_qmc=n_qmc, physical_mask=physical_mask, q_inds=q_inds, tdet_inds=tdet_inds,
-                    sky_inds=sky_inds, sky_prior=sky_prior, t_first_det=t_first_det,
-                    psi=self._qmc_sequence["psi"][q_inds])
+        return dict(
+            n_qmc=n_qmc,
+            physical_mask=physical_mask,
+            q_inds=q_inds,
+            tdet_inds=tdet_inds,
+            sky_inds=sky_inds,
+            sky_prior=sky_prior,
+            t_first_det=t_first_det,
+            psi=self._qmc_sequence["psi"][q_inds],
+        )
 
     def get_fplus_fcross(self, sky_inds, q_inds):
         """
@@ -899,15 +1042,26 @@ class CoherentScore:
         points, an interpolating polynomial.
         """
         t_rng = new_times.min(), new_times.max()
-        i_min, i_max = np.clip(np.searchsorted(times, t_rng) + (-1, 1), 0, len(times) - 1)
+        i_min, i_max = np.clip(
+            np.searchsorted(times, t_rng) + (-1, 1), 0, len(times) - 1
+        )
         if i_max - i_min > spline_degree:
-            return make_interp_spline(times[i_min:i_max], timeseries[..., i_min:i_max], k=spline_degree,
-                                      check_finite=False, axis=-1)(new_times)
+            return make_interp_spline(
+                times[i_min:i_max],
+                timeseries[..., i_min:i_max],
+                k=spline_degree,
+                check_finite=False,
+                axis=-1,
+            )(new_times)
         if i_min == i_max:
             return timeseries[..., (i_min,) * len(new_times)]
-        return krogh_interpolate(times[i_min:i_max], timeseries[..., i_min:i_max], new_times, axis=-1)
+        return krogh_interpolate(
+            times[i_min:i_max], timeseries[..., i_min:i_max], new_times, axis=-1
+        )
 
-    def get_marginalization_info_chunk(self, dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk):
+    def get_marginalization_info_chunk(
+        self, dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk
+    ):
         """
         Draw the samples of chunk :code:`i_chunk` of the current QMC
         sequence from :code:`t_arrival_prob` and return their
@@ -937,35 +1091,75 @@ class CoherentScore:
         MarginalizationInfo
         """
         draws = self.draw_extrinsic_samples(t_arrival_prob, times, i_chunk)
-        q_inds, tdet_inds, t_first_det = draws["q_inds"], draws["tdet_inds"], draws["t_first_det"]
-        sky_inds, sky_prior = np.asarray(draws["sky_inds"], dtype=int), draws["sky_prior"]
+        q_inds, tdet_inds, t_first_det = (
+            draws["q_inds"],
+            draws["tdet_inds"],
+            draws["t_first_det"],
+        )
+        sky_inds, sky_prior = (
+            np.asarray(draws["sky_inds"], dtype=int),
+            draws["sky_prior"],
+        )
         if self.ln_time_prior is not None and len(q_inds) > 0:
             # The time prior: arXiv:2404.02435 Eq. 27 with pi(t_geocenter) normalized, not 1 per second
-            ln_time_prior = np.asarray(self.ln_time_prior(
-                t_first_det - self.sky_dict.geocenter_delay_first_det[sky_inds]), dtype=float)
+            ln_time_prior = np.asarray(
+                self.ln_time_prior(
+                    t_first_det - self.sky_dict.geocenter_delay_first_det[sky_inds]
+                ),
+                dtype=float,
+            )
             inside = ln_time_prior > -np.inf
             q_inds, tdet_inds, t_first_det, sky_inds = (
-                q_inds[inside], tdet_inds[:, inside], t_first_det[inside], sky_inds[inside])
+                q_inds[inside],
+                tdet_inds[:, inside],
+                t_first_det[inside],
+                sky_inds[inside],
+            )
             sky_prior = sky_prior[inside] * np.exp(ln_time_prior[inside])
         if len(q_inds) == 0:
             return MarginalizationInfo(
-                qmc_sequence_id=self._current_qmc_sequence_id, ln_numerators=np.array([]),
-                q_inds=np.array([], int), o_inds=np.array([], int), sky_inds=np.array([], int),
-                t_first_det=np.array([]), d_h=np.array([]), h_h=np.array([]), tdet_inds=tdet_inds,
-                flip_psi=np.array([], bool), proposals_n_qmc=[draws["n_qmc"]], proposals=[t_arrival_prob])
+                qmc_sequence_id=self._current_qmc_sequence_id,
+                ln_numerators=np.array([]),
+                q_inds=np.array([], int),
+                o_inds=np.array([], int),
+                sky_inds=np.array([], int),
+                t_first_det=np.array([]),
+                d_h=np.array([]),
+                h_h=np.array([]),
+                tdet_inds=tdet_inds,
+                flip_psi=np.array([], bool),
+                proposals_n_qmc=[draws["n_qmc"]],
+                proposals=[t_arrival_prob],
+            )
 
         fplus_fcross = self.get_fplus_fcross(sky_inds, q_inds)
-        t_det = np.vstack((t_first_det, t_first_det + self.sky_dict.delays[:, sky_inds]))
-        dh_dmpq = np.array([self.interp_locally(times, dh_mptd[..., i_det], t_det[i_det])
-                            for i_det in range(len(self.sky_dict.detector_names))])
+        t_det = np.vstack(
+            (t_first_det, t_first_det + self.sky_dict.delays[:, sky_inds])
+        )
+        dh_dmpq = np.array(
+            [
+                self.interp_locally(times, dh_mptd[..., i_det], t_det[i_det])
+                for i_det in range(len(self.sky_dict.detector_names))
+            ]
+        )
         dh_qo, hh_qo = self.get_dh_hh_qo(fplus_fcross, dh_dmpq, hh_mppd)
-        ln_numerators, important, flip_psi = self.get_lnnumerators_important_flippsi(dh_qo, hh_qo, sky_prior)
+        ln_numerators, important, flip_psi = self.get_lnnumerators_important_flippsi(
+            dh_qo, hh_qo, sky_prior
+        )
         return MarginalizationInfo(
-            qmc_sequence_id=self._current_qmc_sequence_id, ln_numerators=ln_numerators,
-            q_inds=q_inds[important[0]], o_inds=important[1], sky_inds=sky_inds[important[0]],
-            t_first_det=t_first_det[important[0]], d_h=dh_qo[important], h_h=hh_qo[important],
-            tdet_inds=tdet_inds[:, important[0]], flip_psi=flip_psi, proposals_n_qmc=[draws["n_qmc"]],
-            proposals=[t_arrival_prob])
+            qmc_sequence_id=self._current_qmc_sequence_id,
+            ln_numerators=ln_numerators,
+            q_inds=q_inds[important[0]],
+            o_inds=important[1],
+            sky_inds=sky_inds[important[0]],
+            t_first_det=t_first_det[important[0]],
+            d_h=dh_qo[important],
+            h_h=hh_qo[important],
+            tdet_inds=tdet_inds[:, important[0]],
+            flip_psi=flip_psi,
+            proposals_n_qmc=[draws["n_qmc"]],
+            proposals=[t_arrival_prob],
+        )
 
     def kde_t_arrival_prob(self, marginalization_info, times):
         """
@@ -979,7 +1173,7 @@ class CoherentScore:
         info = marginalization_info
         delays = self.sky_dict.delays[:, info.sky_inds]
         t_det = np.vstack((info.t_first_det, info.t_first_det + delays))
-        silverman_factor = (3 / 4 * info.n_effective) ** -.2
+        silverman_factor = (3 / 4 * info.n_effective) ** -0.2
         dt = times[1] - times[0]
         bins = np.concatenate([[-np.inf], times[:-1] + dt / 2, [np.inf]])
         prob = []
@@ -993,8 +1187,14 @@ class CoherentScore:
         prob = np.array(prob)
         return prob / prob.sum(axis=1, keepdims=True)
 
-    def adapt_marginalization_info(self, dh_mptd, hh_mppd, times, t_arrival_prob,
-                                   lnl_marginalized_threshold=-np.inf):
+    def adapt_marginalization_info(
+        self,
+        dh_mptd,
+        hh_mppd,
+        times,
+        t_arrival_prob,
+        lnl_marginalized_threshold=-np.inf,
+    ):
         """
         Run the adaptive importance sampling on the next QMC sequence, as
         cogwheel's :code:`BaseCoherentScore._get_marginalization_info`
@@ -1011,7 +1211,9 @@ class CoherentScore:
         """
         self.switch_qmc_sequence()
         i_chunk = 0
-        info = self.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk)
+        info = self.get_marginalization_info_chunk(
+            dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk
+        )
         while info.n_effective < self.min_n_effective:
             i_chunk += 1
             if i_chunk == len(self._qmc_ind_chunks):
@@ -1019,13 +1221,24 @@ class CoherentScore:
                 break
             if info.n_effective == 0:
                 break
-            if info.n_effective > 2 and info.lnl_marginalized < lnl_marginalized_threshold:
+            if (
+                info.n_effective > 2
+                and info.lnl_marginalized < lnl_marginalized_threshold
+            ):
                 break
-            t_arrival_prob = .5 * (self.kde_t_arrival_prob(info, times) + t_arrival_prob)
-            info.update(self.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk))
+            t_arrival_prob = 0.5 * (
+                self.kde_t_arrival_prob(info, times) + t_arrival_prob
+            )
+            info.update(
+                self.get_marginalization_info_chunk(
+                    dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk
+                )
+            )
         return info
 
-    def get_marginalization_info(self, dh_mptd, hh_mppd, times, lnl_marginalized_threshold=-np.inf):
+    def get_marginalization_info(
+        self, dh_mptd, hh_mppd, times, lnl_marginalized_threshold=-np.inf
+    ):
         """
         Return the likelihood marginalized over the extrinsic parameters,
         with its samples, as cogwheel's
@@ -1056,12 +1269,14 @@ class CoherentScore:
         """
         dh_mptd, times = self.sky_dict.resample_timeseries(dh_mptd, times, axis=-2)
         t_arrival_prob = self.get_t_arrival_proposal(dh_mptd, hh_mppd)
-        info = self.adapt_marginalization_info(dh_mptd, hh_mppd, times, t_arrival_prob, lnl_marginalized_threshold)
+        info = self.adapt_marginalization_info(
+            dh_mptd, hh_mppd, times, t_arrival_prob, lnl_marginalized_threshold
+        )
         if self.learning_rate and info.n_effective > self.min_n_effective:
             self.remember_t_arrival_proposal(info.proposals[-1])
         return info
 
-    def optimize_beta_temperature(self, dh_mptd, hh_mppd, times, beta_rng=(.1, 1)):
+    def optimize_beta_temperature(self, dh_mptd, hh_mppd, times, beta_rng=(0.1, 1)):
         """
         Set :code:`beta_temperature`, one value per interferometer, to
         minimize the number of samples per effective sample, as cogwheel's
@@ -1074,7 +1289,9 @@ class CoherentScore:
         proposal, as in cogwheel.
         """
         number = len(self.sky_dict.detector_names)
-        beta_temperature = np.array(np.broadcast_to(self.beta_temperature, number), dtype=float)
+        beta_temperature = np.array(
+            np.broadcast_to(self.beta_temperature, number), dtype=float
+        )
         betas = np.geomspace(*beta_rng, 100)
         saved = self.beta_temperature, self.min_n_effective
         try:
@@ -1086,7 +1303,9 @@ class CoherentScore:
                         beta_temperature[i_det] = beta
                         info = self.get_marginalization_info(dh_mptd, hh_mppd, times)
                         cost.append(info.n_qmc / (info.n_effective + 1e-3))
-                    cost_smooth = scipy.signal.savgol_filter(cost, len(cost) // 10, 1, mode="nearest")
+                    cost_smooth = scipy.signal.savgol_filter(
+                        cost, len(cost) // 10, 1, mode="nearest"
+                    )
                     beta_temperature[i_det] = betas[np.argmin(cost_smooth)]
         finally:
             self.beta_temperature, self.min_n_effective = saved
@@ -1140,7 +1359,12 @@ class CoherentScore:
             psi = np.where(flipped, (psi + np.pi / 2) % np.pi, psi)
             d_h = np.where(flipped, -d_h, d_h)
         return dict(
-            lat=self.sky_dict.sky_samples["lat"][sky_inds], lon=self.sky_dict.sky_samples["lon"][sky_inds],
-            psi=psi, phase=self.phi_ref[info.o_inds[chosen]],
-            t_geocenter=info.t_first_det[chosen] - self.sky_dict.geocenter_delay_first_det[sky_inds],
-            d_h=d_h, h_h=info.h_h[chosen].astype(float))
+            lat=self.sky_dict.sky_samples["lat"][sky_inds],
+            lon=self.sky_dict.sky_samples["lon"][sky_inds],
+            psi=psi,
+            phase=self.phi_ref[info.o_inds[chosen]],
+            t_geocenter=info.t_first_det[chosen]
+            - self.sky_dict.geocenter_delay_first_det[sky_inds],
+            d_h=d_h,
+            h_h=info.h_h[chosen].astype(float),
+        )

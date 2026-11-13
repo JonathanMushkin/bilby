@@ -14,12 +14,17 @@ from ...core.utils import logger, radius_of_earth, speed_of_light
 # GPS time is cogwheel's isotropic prior in Earth-fixed longitude and latitude), polarization uniform on (0, pi),
 # orbital phase uniform on (0, 2 pi) and geocentric arrival time uniform
 _MARGINALIZED_PRIORS = dict(
-    ra=(Uniform, 0, 2 * np.pi), dec=(Cosine, -np.pi / 2, np.pi / 2), psi=(Uniform, 0, np.pi),
-    phase=(Uniform, 0, 2 * np.pi), geocent_time=(Uniform, None, None))
+    ra=(Uniform, 0, 2 * np.pi),
+    dec=(Cosine, -np.pi / 2, np.pi / 2),
+    psi=(Uniform, 0, np.pi),
+    phase=(Uniform, 0, 2 * np.pi),
+    geocent_time=(Uniform, None, None),
+)
 
 
 class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
-        ModeByModeRelativeBinningGravitationalWaveTransient):
+    ModeByModeRelativeBinningGravitationalWaveTransient
+):
     """A gravitational-wave transient likelihood object which marginalizes
     over the extrinsic parameters (sky location, arrival time,
     polarization, orbital phase and distance) with the algorithm of
@@ -133,24 +138,27 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
     Calibration marginalization and calibration models are not supported.
     """
 
-    def __init__(self, interferometers,
-                 waveform_generator,
-                 priors,
-                 fiducial_parameters=None,
-                 chi=1,
-                 epsilon=0.5,
-                 spline_degree=3,
-                 safe_fiducial_parameters=True,
-                 linear_free=True,
-                 dlnl_threshold=12.,
-                 time_padding=None,
-                 distance_marginalization_lookup_table=None,
-                 reject_low_n_effective=True,
-                 dlnl_marginalized_threshold=30.,
-                 optimize_beta_temperature=True,
-                 coherent_score_kwargs=None,
-                 sky_dictionary_kwargs=None,
-                 flip_psi=True):
+    def __init__(
+        self,
+        interferometers,
+        waveform_generator,
+        priors,
+        fiducial_parameters=None,
+        chi=1,
+        epsilon=0.5,
+        spline_degree=3,
+        safe_fiducial_parameters=True,
+        linear_free=True,
+        dlnl_threshold=12.0,
+        time_padding=None,
+        distance_marginalization_lookup_table=None,
+        reject_low_n_effective=True,
+        dlnl_marginalized_threshold=30.0,
+        optimize_beta_temperature=True,
+        coherent_score_kwargs=None,
+        sky_dictionary_kwargs=None,
+        flip_psi=True,
+    ):
         self.flip_psi = flip_psi
         self._check_extrinsic_priors(priors)
         self.dlnl_threshold = dlnl_threshold
@@ -161,7 +169,8 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         self.marginalization_info = None
         self.coherent_score = None  # made after the parent's construction
         self.times, self.time_padding = self._get_time_grid(
-            interferometers, priors, waveform_generator, time_padding)
+            interferometers, priors, waveform_generator, time_padding
+        )
         self._largest_time_shift_warned = None
         self.time_series_summary_data = dict()
         self.linear_free = linear_free
@@ -177,30 +186,57 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             spline_degree=spline_degree,
             safe_fiducial_parameters=safe_fiducial_parameters,
             distance_marginalization=True,
-            distance_marginalization_lookup_table=distance_marginalization_lookup_table)
+            distance_marginalization_lookup_table=distance_marginalization_lookup_table,
+        )
 
         # Fix the marginalized parameters in the priors passed in, as GravitationalWaveTransient does for the distance
         for key in _MARGINALIZED_PRIORS:
-            priors[key] = 0.0 if key != "geocent_time" else float(np.mean(
-                [self.priors["geocent_time"].minimum, self.priors["geocent_time"].maximum]))
+            priors[key] = (
+                0.0
+                if key != "geocent_time"
+                else float(
+                    np.mean(
+                        [
+                            self.priors["geocent_time"].minimum,
+                            self.priors["geocent_time"].maximum,
+                        ]
+                    )
+                )
+            )
             self._marginalized_parameters.append(key)
 
         sky_dictionary_kwargs = dict(sky_dictionary_kwargs or dict())
         sky_dictionary_kwargs.setdefault(
-            "f_sampling", SkyDictionary.choose_f_sampling(self.waveform_generator.frequency_array[-1]))
+            "f_sampling",
+            SkyDictionary.choose_f_sampling(
+                self.waveform_generator.frequency_array[-1]
+            ),
+        )
         mode_array = self.waveform_generator.waveform_arguments.get(
-            "mode_array", [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4]])
+            "mode_array", [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4]]
+        )
         m_arr = list(dict.fromkeys(int(mode[1]) for mode in mode_array))
         self.coherent_score = CoherentScore(
-            SkyDictionary(self.interferometers, **sky_dictionary_kwargs), m_arr,
-            self._lnlike_marginalized_over_distance, dlnl_threshold=dlnl_threshold,
-            ln_time_prior=self._ln_time_prior, **(coherent_score_kwargs or dict()))
+            SkyDictionary(self.interferometers, **sky_dictionary_kwargs),
+            m_arr,
+            self._lnlike_marginalized_over_distance,
+            dlnl_threshold=dlnl_threshold,
+            ln_time_prior=self._ln_time_prior,
+            **(coherent_score_kwargs or dict()),
+        )
 
         if optimize_beta_temperature:
             d_inner_h, h_inner_h, time_shift = self.get_time_series_inner_products(
-                self.waveform_generator.frequency_domain_strain(self._waveform_parameters(self.fiducial_parameters)))
-            self.coherent_score.optimize_beta_temperature(d_inner_h, h_inner_h, self.times - time_shift)
-        self.log_likelihood_ratio(self.fiducial_parameters)  # sets the largest estimate so far, as cogwheel
+                self.waveform_generator.frequency_domain_strain(
+                    self._waveform_parameters(self.fiducial_parameters)
+                )
+            )
+            self.coherent_score.optimize_beta_temperature(
+                d_inner_h, h_inner_h, self.times - time_shift
+            )
+        self.log_likelihood_ratio(
+            self.fiducial_parameters
+        )  # sets the largest estimate so far, as cogwheel
 
     @staticmethod
     def _check_extrinsic_priors(priors):
@@ -213,10 +249,18 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         for key, (prior_class, minimum, maximum) in _MARGINALIZED_PRIORS.items():
             prior = priors.get(key)
             if not isinstance(prior, prior_class) or (
-                    minimum is not None and not np.allclose([prior.minimum, prior.maximum], [minimum, maximum])):
-                bounds = "" if minimum is None else f" over ({minimum:.6g}, {maximum:.6g})"
-                raise ValueError(f"The marginalization requires a {prior_class.__name__} prior on {key}{bounds}.")
-        if "luminosity_distance" not in priors and not any(key in priors for key in ["redshift", "comoving_distance"]):
+                minimum is not None
+                and not np.allclose([prior.minimum, prior.maximum], [minimum, maximum])
+            ):
+                bounds = (
+                    "" if minimum is None else f" over ({minimum:.6g}, {maximum:.6g})"
+                )
+                raise ValueError(
+                    f"The marginalization requires a {prior_class.__name__} prior on {key}{bounds}."
+                )
+        if "luminosity_distance" not in priors and not any(
+            key in priors for key in ["redshift", "comoving_distance"]
+        ):
             raise ValueError("A prior on luminosity_distance is required.")
 
     def _ln_time_prior(self, t_geocenter):
@@ -228,8 +272,12 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         (research/extrinsic-marginalization/2026-11-11_normalization-audit.md).
         """
         with np.errstate(divide="ignore"):
-            return np.asarray(self.priors["geocent_time"].ln_prob(
-                np.asarray(t_geocenter) + self.interferometers.start_time), dtype=float)
+            return np.asarray(
+                self.priors["geocent_time"].ln_prob(
+                    np.asarray(t_geocenter) + self.interferometers.start_time
+                ),
+                dtype=float,
+            )
 
     def _lnlike_marginalized_over_distance(self, d_inner_h, h_inner_h):
         """
@@ -254,7 +302,9 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         """
         n_effective = marginalization_info.n_effective
         return n_effective < 2 or (
-            marginalization_info.lnl_marginalized > self._max_lnl_marginalized and n_effective < 10)
+            marginalization_info.lnl_marginalized > self._max_lnl_marginalized
+            and n_effective < 10
+        )
 
     def log_likelihood_ratio(self, parameters):
         """
@@ -271,23 +321,35 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             # score exists: the parent's likelihood, marginalized over distance only
             return super().log_likelihood_ratio(parameters)
         waveform_polarizations = self.waveform_generator.frequency_domain_strain(
-            self._waveform_parameters(parameters))
+            self._waveform_parameters(parameters)
+        )
         if waveform_polarizations is None:
             return np.nan_to_num(-np.inf)
-        d_inner_h, h_inner_h, time_shift = self.get_time_series_inner_products(waveform_polarizations)
+        d_inner_h, h_inner_h, time_shift = self.get_time_series_inner_products(
+            waveform_polarizations
+        )
         self.check_time_shift(time_shift)
         info = self.coherent_score.get_marginalization_info(
-            d_inner_h, h_inner_h, self.times - time_shift,
-            lnl_marginalized_threshold=self._max_lnl_marginalized - self.dlnl_marginalized_threshold)
+            d_inner_h,
+            h_inner_h,
+            self.times - time_shift,
+            lnl_marginalized_threshold=self._max_lnl_marginalized
+            - self.dlnl_marginalized_threshold,
+        )
         self.marginalization_info = info
         if self.reject_low_n_effective and self.reject(info):
             self.number_of_rejections += 1
-            if self.number_of_rejections & (self.number_of_rejections - 1) == 0:  # 1, 2, 4, 8, ...
+            if (
+                self.number_of_rejections & (self.number_of_rejections - 1) == 0
+            ):  # 1, 2, 4, 8, ...
                 logger.warning(
                     f"Rejected an estimate of {info.lnl_marginalized:.2f} with effective sample size "
-                    f"{info.n_effective:.2f}; {self.number_of_rejections} rejections so far.")
+                    f"{info.n_effective:.2f}; {self.number_of_rejections} rejections so far."
+                )
             return np.nan_to_num(-np.inf)
-        self._max_lnl_marginalized = max(self._max_lnl_marginalized, info.lnl_marginalized)
+        self._max_lnl_marginalized = max(
+            self._max_lnl_marginalized, info.lnl_marginalized
+        )
         return float(info.lnl_marginalized)
 
     @property
@@ -326,28 +388,47 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             pair.
         """
         self.log_likelihood_ratio(parameters)
-        return self.sample_from_marginalization_info(parameters, self.marginalization_info, self.flip_psi)
+        return self.sample_from_marginalization_info(
+            parameters, self.marginalization_info, self.flip_psi
+        )
 
-    def sample_from_marginalization_info(self, parameters, marginalization_info, flip_psi):
+    def sample_from_marginalization_info(
+        self, parameters, marginalization_info, flip_psi
+    ):
         """
         The second part of :code:`generate_posterior_sample_from_marginalized_likelihood`: draw the six
         marginalized parameters from a given estimate, with or without the polarization flip, using
         :code:`bilby.core.utils.random`.
         """
         parameters = copy.deepcopy(dict(parameters))
-        sample = self.coherent_score.draw_posterior_samples(marginalization_info, 1, random.rng, flip_psi=flip_psi)
+        sample = self.coherent_score.draw_posterior_samples(
+            marginalization_info, 1, random.rng, flip_psi=flip_psi
+        )
         sample = {key: value[0] for key, value in sample.items()}
         if np.isnan(sample["d_h"]):
-            parameters.update(dict.fromkeys(_MARGINALIZED_PRIORS, np.nan), luminosity_distance=np.nan)
+            parameters.update(
+                dict.fromkeys(_MARGINALIZED_PRIORS, np.nan), luminosity_distance=np.nan
+            )
             return parameters
         ratio = self._ref_dist / self._distance_array
-        distance_log_like = sample["d_h"] * ratio - sample["h_h"] * ratio ** 2 / 2
-        distance_posterior = np.exp(distance_log_like - np.max(distance_log_like)) * self.distance_prior_array
+        distance_log_like = sample["d_h"] * ratio - sample["h_h"] * ratio**2 / 2
+        distance_posterior = (
+            np.exp(distance_log_like - np.max(distance_log_like))
+            * self.distance_prior_array
+        )
         parameters.update(
-            ra=float((sample["lon"] + greenwich_mean_sidereal_time(self.reference_gps_time)) % (2 * np.pi)),
-            dec=float(sample["lat"]), psi=float(sample["psi"]), phase=float(sample["phase"]),
+            ra=float(
+                (sample["lon"] + greenwich_mean_sidereal_time(self.reference_gps_time))
+                % (2 * np.pi)
+            ),
+            dec=float(sample["lat"]),
+            psi=float(sample["psi"]),
+            phase=float(sample["phase"]),
             geocent_time=float(self.interferometers.start_time + sample["t_geocenter"]),
-            luminosity_distance=float(Interped(self._distance_array, distance_posterior).sample()))
+            luminosity_distance=float(
+                Interped(self._distance_array, distance_posterior).sample()
+            ),
+        )
         return parameters
 
     @staticmethod
@@ -384,9 +465,19 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         if priors is None or not isinstance(priors.get("geocent_time"), Uniform):
             raise ValueError("A Uniform prior on geocent_time is required.")
         start_time = interferometers.start_time
-        minimum = priors["geocent_time"].minimum - start_time - radius_of_earth / speed_of_light
-        maximum = priors["geocent_time"].maximum - start_time + radius_of_earth / speed_of_light
-        padding = (maximum - minimum) / 10 if time_padding is None else float(time_padding)
+        minimum = (
+            priors["geocent_time"].minimum
+            - start_time
+            - radius_of_earth / speed_of_light
+        )
+        maximum = (
+            priors["geocent_time"].maximum
+            - start_time
+            + radius_of_earth / speed_of_light
+        )
+        padding = (
+            (maximum - minimum) / 10 if time_padding is None else float(time_padding)
+        )
         spacing = 1 / (2 * waveform_generator.frequency_array[-1])
         return np.arange(minimum - padding, maximum + padding, spacing), padding
 
@@ -411,7 +502,9 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         :code:`time_shift_margin` is at least :code:`abs(time_shift)`.
         """
         unpadded = self.times[-1] - self.times[0] - 2 * self.time_padding
-        return (abs(time_shift) + self._TAPERED_FRACTION * unpadded) / (1 - 2 * self._TAPERED_FRACTION)
+        return (abs(time_shift) + self._TAPERED_FRACTION * unpadded) / (
+            1 - 2 * self._TAPERED_FRACTION
+        )
 
     def check_time_shift(self, time_shift):
         """
@@ -429,12 +522,16 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         """
         if abs(time_shift) <= self.time_shift_margin:
             return True
-        if self._largest_time_shift_warned is None or abs(time_shift) > self._largest_time_shift_warned:
+        if (
+            self._largest_time_shift_warned is None
+            or abs(time_shift) > self._largest_time_shift_warned
+        ):
             self._largest_time_shift_warned = abs(time_shift)
             logger.warning(
                 f"The linear-free time shift {time_shift:.4g} s exceeds the margin of the time grid, "
                 f"{self.time_shift_margin:.4g} s: part of the geocent_time prior is not covered. Set "
-                f"time_padding to at least {self.required_time_padding(time_shift):.4g} s to cover it.")
+                f"time_padding to at least {self.required_time_padding(time_shift):.4g} s to cover it."
+            )
         return False
 
     def compute_summary_data(self):
@@ -466,44 +563,91 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         # fiducial waveforms are not stored
         inverse_psds = dict()
         for interferometer in self.interferometers:
-            inverse_psds[interferometer.name] = np.zeros(len(interferometer.frequency_array))
+            inverse_psds[interferometer.name] = np.zeros(
+                len(interferometer.frequency_array)
+            )
             inverse_psds[interferometer.name][interferometer.frequency_mask] = (
-                1 / interferometer.power_spectral_density_array[interferometer.frequency_mask])
+                1
+                / interferometer.power_spectral_density_array[
+                    interferometer.frequency_mask
+                ]
+            )
         network_inverse_psd = sum(inverse_psds.values())
         frequency_array = self.interferometers[0].frequency_array
         parameters = self.fiducial_waveform_parameters
 
         for interferometer in self.interferometers:
             name = interferometer.name
-            time_shift = np.exp(-2j * np.pi * frequency_array * (
-                parameters["geocent_time"] - interferometer.strain_data.start_time))
+            time_shift = np.exp(
+                -2j
+                * np.pi
+                * frequency_array
+                * (parameters["geocent_time"] - interferometer.strain_data.start_time)
+            )
             h0 = self.per_detector_fiducial_mode_waveforms[name] / time_shift
             h0_bins = h0[:, self.bin_inds]
             for harmonic in range(number_of_harmonics):
-                self._fade_ringdown(h0[harmonic], h0_bins[harmonic], frequency_array, network_inverse_psd)
+                self._fade_ringdown(
+                    h0[harmonic],
+                    h0_bins[harmonic],
+                    frequency_array,
+                    network_inverse_psd,
+                )
             h0 *= time_shift
             h0_bins *= time_shift[self.bin_inds]
 
             # t_0: the arrival time of h0 at the interferometer minus the start time, as in get_detector_response
-            arrival_time = parameters["geocent_time"] - interferometer.strain_data.start_time + (
-                interferometer.time_delay_from_geocenter(parameters["ra"], parameters["dec"], parameters["geocent_time"]))
-            integrand = h0.conj() * interferometer.frequency_domain_strain * inverse_psds[name]
-            weights = np.array([
-                self._get_summary_weights(
-                    integrand * np.exp(2j * np.pi * frequency_array * (time - arrival_time)), interferometer.duration)
-                for time in self.times])  # (time, harmonic, bin edge)
-            denominator = h0_bins.conj() * np.exp(-2j * np.pi * self.bin_freqs * arrival_time)
-            self.time_series_summary_data[name] = np.moveaxis(weights, 0, 1) / denominator[:, np.newaxis]
+            arrival_time = (
+                parameters["geocent_time"]
+                - interferometer.strain_data.start_time
+                + (
+                    interferometer.time_delay_from_geocenter(
+                        parameters["ra"], parameters["dec"], parameters["geocent_time"]
+                    )
+                )
+            )
+            integrand = (
+                h0.conj() * interferometer.frequency_domain_strain * inverse_psds[name]
+            )
+            weights = np.array(
+                [
+                    self._get_summary_weights(
+                        integrand
+                        * np.exp(2j * np.pi * frequency_array * (time - arrival_time)),
+                        interferometer.duration,
+                    )
+                    for time in self.times
+                ]
+            )  # (time, harmonic, bin edge)
+            denominator = h0_bins.conj() * np.exp(
+                -2j * np.pi * self.bin_freqs * arrival_time
+            )
+            self.time_series_summary_data[name] = (
+                np.moveaxis(weights, 0, 1) / denominator[:, np.newaxis]
+            )
 
-        # The reference and weights of the linear-free time convention: the plus polarization of the m = 2 harmonic of the
-        # fiducial waveform, faded, and the square root of the summary weights of its squared amplitude over the
-        # network noise, as cogwheel's BaseLinearFree._set_summary
-        reference = np.copy(self.fiducial_polarizations["plus"][self._harmonic_index(2)])
+        # The reference and weights of the linear-free time convention: the plus
+        # polarization of the m = 2 harmonic of the fiducial waveform, faded, and the
+        # square root of the summary weights of its squared amplitude over the network
+        # noise, as cogwheel's BaseLinearFree._set_summary
+        reference = np.copy(
+            self.fiducial_polarizations["plus"][self._harmonic_index(2)]
+        )
         reference_bins = reference[self.bin_inds]
-        self._fade_ringdown(reference, reference_bins, frequency_array, network_inverse_psd)
+        self._fade_ringdown(
+            reference, reference_bins, frequency_array, network_inverse_psd
+        )
         self._linear_free_reference = reference_bins
-        self._linear_free_weights = np.sqrt(np.clip(self._get_summary_weights(
-            np.abs(reference) ** 2 * network_inverse_psd, self.interferometers[0].duration).real, 0, None))
+        self._linear_free_weights = np.sqrt(
+            np.clip(
+                self._get_summary_weights(
+                    np.abs(reference) ** 2 * network_inverse_psd,
+                    self.interferometers[0].duration,
+                ).real,
+                0,
+                None,
+            )
+        )
 
     def _harmonic_index(self, m):
         """
@@ -512,7 +656,8 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         :code:`mode_array` (:func:`lal_binary_black_hole_relative_binning_by_mode`).
         """
         mode_array = self.waveform_generator.waveform_arguments.get(
-            "mode_array", [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4]])
+            "mode_array", [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4]]
+        )
         return list(dict.fromkeys(int(mode[1]) for mode in mode_array)).index(m)
 
     def get_linear_free_time_shift(self, waveform_polarizations):
@@ -537,10 +682,17 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             In seconds; the waveform times :math:`e^{2 \\pi i f \\delta}` is
             aligned with the fiducial waveform, :math:`\\delta` the time shift.
         """
-        ratio = waveform_polarizations["plus"][self._harmonic_index(2)] / self._linear_free_reference
+        ratio = (
+            waveform_polarizations["plus"][self._harmonic_index(2)]
+            / self._linear_free_reference
+        )
         phase = np.unwrap(np.angle(ratio))
         fit = np.polynomial.Polynomial.fit(
-            self.bin_freqs, phase, deg=1, w=self._linear_free_weights * np.sqrt(np.abs(ratio)))
+            self.bin_freqs,
+            phase,
+            deg=1,
+            w=self._linear_free_weights * np.sqrt(np.abs(ratio)),
+        )
         return -fit.deriv()(0) / (2 * np.pi)
 
     def get_time_series_inner_products(self, waveform_polarizations):
@@ -575,15 +727,32 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         time_shift: float
             In seconds; see above.
         """
-        waveform = np.array([waveform_polarizations["plus"], waveform_polarizations["cross"]])  # (p, m, j)
-        time_shift = self.get_linear_free_time_shift(waveform_polarizations) if self.linear_free else 0.0
+        waveform = np.array(
+            [waveform_polarizations["plus"], waveform_polarizations["cross"]]
+        )  # (p, m, j)
+        time_shift = (
+            self.get_linear_free_time_shift(waveform_polarizations)
+            if self.linear_free
+            else 0.0
+        )
         waveform = waveform * np.exp(2j * np.pi * self.bin_freqs * time_shift)
         m_inds, mprime_inds = self.harmonic_pairs
         d_inner_h, h_inner_h = list(), list()
         for interferometer in self.interferometers:
-            d_inner_h.append(np.einsum(
-                "mtj,pmj->mpt", self.time_series_summary_data[interferometer.name], waveform.conj()))
+            d_inner_h.append(
+                np.einsum(
+                    "mtj,pmj->mpt",
+                    self.time_series_summary_data[interferometer.name],
+                    waveform.conj(),
+                )
+            )
             h_inner_h_weights = self.summary_data[interferometer.name][1]
-            h_inner_h.append(np.einsum(
-                "kj,pkj,qkj->kpq", h_inner_h_weights, waveform[:, m_inds], waveform[:, mprime_inds].conj()))
+            h_inner_h.append(
+                np.einsum(
+                    "kj,pkj,qkj->kpq",
+                    h_inner_h_weights,
+                    waveform[:, m_inds],
+                    waveform[:, mprime_inds].conj(),
+                )
+            )
         return np.stack(d_inner_h, axis=-1), np.stack(h_inner_h, axis=-1), time_shift
