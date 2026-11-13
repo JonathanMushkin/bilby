@@ -2,7 +2,7 @@ import numpy as np
 
 from .relative_modes import ModeByModeRelativeBinningGravitationalWaveTransient
 from ...core.prior import Uniform
-from ...core.utils import radius_of_earth, speed_of_light
+from ...core.utils import logger, radius_of_earth, speed_of_light
 
 
 class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
@@ -55,6 +55,15 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         is dropped when its log likelihood maximized over distance is more
         than this below the largest (arXiv:2404.02435 Sec. A6), see
         :code:`CoherentScore`. Default is 12, as cogwheel.
+    time_padding: float, optional
+        In seconds, the time added at each end of the grid of arrival times
+        beyond the range of the :code:`geocent_time` prior widened by the
+        light travel time across the radius of the Earth. Default is
+        :code:`None`, a tenth of that widened range. The resampling of the
+        time series tapers 5% of the grid at each end, so the grid serves
+        every arrival time of the prior only while the linear-free time
+        shift is at most :code:`time_shift_margin`; see
+        :code:`check_time_shift`.
 
     Notes
     -----
@@ -70,9 +79,12 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
                  spline_degree=3,
                  safe_fiducial_parameters=True,
                  linear_free=True,
-                 dlnl_threshold=12.):
+                 dlnl_threshold=12.,
+                 time_padding=None):
         self.dlnl_threshold = dlnl_threshold
-        self.times = self._get_time_grid(interferometers, priors, waveform_generator)
+        self.times, self.time_padding = self._get_time_grid(
+            interferometers, priors, waveform_generator, time_padding)
+        self._largest_time_shift_warned = None
         self.time_series_summary_data = dict()
         self.linear_free = linear_free
         self._linear_free_reference = None
@@ -88,13 +100,14 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             safe_fiducial_parameters=safe_fiducial_parameters)
 
     @staticmethod
-    def _get_time_grid(interferometers, priors, waveform_generator):
+    def _get_time_grid(interferometers, priors, waveform_generator, time_padding=None):
         """
         Return the grid of arrival times at the interferometers, relative to
-        the start time of the data: the range of the :code:`geocent_time`
-        prior, widened on each side by the light travel time across the
-        radius of the Earth and by a tenth of its length, with spacing half
-        the inverse of the largest frequency, as cogwheel
+        the start time of the data, and its padding: the range of the
+        :code:`geocent_time` prior, widened on each side by the light travel
+        time across the radius of the Earth and then by :code:`time_padding`
+        (a tenth of the widened range if :code:`None`), with spacing half the
+        inverse of the largest frequency, as cogwheel
         (:code:`MarginalizedExtrinsicLikelihood`, which uses a fixed range of
         0.14 s). The times are kept relative to the start time because a
         GPS time in float64 resolves only about 2e-7 s.
@@ -107,20 +120,71 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             The priors, with a :code:`Uniform` prior on :code:`geocent_time`.
         waveform_generator: bilby.gw.waveform_generator.WaveformGenerator
             Gives the largest frequency.
+        time_padding: float, optional
+            In seconds; see the class.
 
         Returns
         -------
         times: array_like
             The arrival times minus the start time of the data (s).
+        time_padding: float
+            In seconds.
         """
         if priors is None or not isinstance(priors.get("geocent_time"), Uniform):
             raise ValueError("A Uniform prior on geocent_time is required.")
         start_time = interferometers.start_time
         minimum = priors["geocent_time"].minimum - start_time - radius_of_earth / speed_of_light
         maximum = priors["geocent_time"].maximum - start_time + radius_of_earth / speed_of_light
-        padding = (maximum - minimum) / 10
+        padding = (maximum - minimum) / 10 if time_padding is None else float(time_padding)
         spacing = 1 / (2 * waveform_generator.frequency_array[-1])
-        return np.arange(minimum - padding, maximum + padding, spacing)
+        return np.arange(minimum - padding, maximum + padding, spacing), padding
+
+    # The fraction of the time grid tapered at each end when the time series are resampled
+    # (SkyDictionary.resample_timeseries, a Tukey window with parameter 0.1)
+    _TAPERED_FRACTION = 0.05
+
+    @property
+    def time_shift_margin(self):
+        """
+        In seconds, the largest linear-free time shift for which the
+        untapered part of the time grid holds every arrival time of the
+        :code:`geocent_time` prior: the padding minus the length tapered at
+        each end.
+        """
+        duration = self.times[-1] - self.times[0]
+        return self.time_padding - self._TAPERED_FRACTION * duration
+
+    def required_time_padding(self, time_shift):
+        """
+        In seconds, the smallest :code:`time_padding` whose
+        :code:`time_shift_margin` is at least :code:`abs(time_shift)`.
+        """
+        unpadded = self.times[-1] - self.times[0] - 2 * self.time_padding
+        return (abs(time_shift) + self._TAPERED_FRACTION * unpadded) / (1 - 2 * self._TAPERED_FRACTION)
+
+    def check_time_shift(self, time_shift):
+        """
+        Log a warning if :code:`abs(time_shift)`, a linear-free time shift
+        in seconds, exceeds :code:`time_shift_margin`, and more than any
+        shift warned about before. Then part of the :code:`geocent_time`
+        prior falls in a tapered end of the time grid or off it, and its
+        likelihood is distorted or zero. The warning names the
+        :code:`time_padding` that would cover the shift.
+
+        Returns
+        -------
+        bool
+            Whether the shift is within the margin.
+        """
+        if abs(time_shift) <= self.time_shift_margin:
+            return True
+        if self._largest_time_shift_warned is None or abs(time_shift) > self._largest_time_shift_warned:
+            self._largest_time_shift_warned = abs(time_shift)
+            logger.warning(
+                f"The linear-free time shift {time_shift:.4g} s exceeds the margin of the time grid, "
+                f"{self.time_shift_margin:.4g} s: part of the geocent_time prior is not covered. Set "
+                f"time_padding to at least {self.required_time_padding(time_shift):.4g} s to cover it.")
+        return False
 
     def compute_summary_data(self):
         r"""

@@ -9,6 +9,7 @@ from scipy.special import logsumexp
 
 from bilby.gw.likelihood.coherent_score import (
     CoherentScore,
+    MarginalizationInfo,
     SkyDictionary,
     exp_normalize,
     get_antenna_patterns_at_zero_polarization,
@@ -537,6 +538,160 @@ class TestLinearFreeTimeSeriesInnerProducts(TestTimeSeriesInnerProducts):
         delayed["plus"][index] = self.likelihood._linear_free_reference * np.exp(
             -2j * np.pi * self.likelihood.bin_freqs * 3e-3)
         self.assertAlmostEqual(self.likelihood.get_linear_free_time_shift(delayed), 3e-3, delta=1e-9)
+
+
+def gaussian_lnlike(d_inner_h, h_inner_h):
+    """The log likelihood at the distance the waveform was generated at, standing in for the likelihood
+    marginalized over distance in tests of the bookkeeping."""
+    return d_inner_h - h_inner_h / 2
+
+
+class TestImportanceSampling(unittest.TestCase):
+    """The weights and the adaptive importance sampling, for one, two and
+    three interferometers: bookkeeping against cogwheel's definitions."""
+    number_of_times = 1200  # 0.146 s at 8192 Hz; longer than the largest delay range in cells (H1-V1, 435)
+    m_arr = [2, 1, 3, 4]
+
+    @classmethod
+    def make_score(cls, names, lnlike=gaussian_lnlike, **kwargs):
+        sky_dict = SkyDictionary(bilby.gw.detector.InterferometerList(list(names)), nsky=10 ** 5)
+        return CoherentScore(sky_dict, cls.m_arr, lnlike, n_qmc_sequences=2, **kwargs)
+
+    def times(self, sky_dict):
+        return 0.3 + np.arange(self.number_of_times) / sky_dict.f_sampling
+
+    def peaked_time_series(self, number_of_ifos, seed=3):
+        # noise in every harmonic, polarization and interferometer, plus a peak at a different time in each
+        rng = np.random.default_rng(seed)
+        shape = (len(self.m_arr), 2, self.number_of_times, number_of_ifos)
+        dh_mptd = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+        for i_ifo in range(number_of_ifos):
+            dh_mptd[0, 0, 600 + 20 * i_ifo, i_ifo] += 15.0
+        n_pairs = len(self.m_arr) * (len(self.m_arr) + 1) // 2
+        hh_mppd = np.zeros((n_pairs, 2, 2, number_of_ifos), dtype=complex)
+        hh_mppd[:, 0, 0] = hh_mppd[:, 1, 1] = 1.0
+        return dh_mptd, hh_mppd
+
+    def test_time_prior_excludes_every_sample(self):
+        # a time prior with zero density everywhere drops every sample
+        score = self.make_score(("H1", "L1"))
+        score.ln_time_prior = lambda t: np.full(np.shape(t), -np.inf)
+        info = score.get_marginalization_info(*self.peaked_time_series(2), self.times(score.sky_dict))
+        self.assertEqual(info.lnl_marginalized, -np.inf)
+        self.assertEqual(info.n_effective, 0)
+        self.assertEqual(info.n_qmc, 2 ** score.log2n_qmc)
+
+    @parameterized.expand(NETWORKS)
+    def test_weights(self, *names):
+        # the estimate is the sum of the numerators over the balance-heuristic denominators
+        score = self.make_score(names, lnlike=gaussian_lnlike)
+        times = self.times(score.sky_dict)
+        dh_mptd, hh_mppd = self.peaked_time_series(len(names))
+        proposal = score.get_t_arrival_proposal(dh_mptd, hh_mppd)
+        info = score.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, proposal, 0)
+        denominators = 2 ** score.log2n_qmc * np.prod(np.take_along_axis(proposal, info.tdet_inds, axis=1), axis=0)
+        self.assertAlmostEqual(info.lnl_marginalized, logsumexp(info.ln_numerators - np.log(denominators)))
+        self.assertAlmostEqual(np.sum(info.weights), 1.0)
+        self.assertAlmostEqual(np.sum(info.weights_q), 1.0)
+        self.assertLessEqual(len(info.weights_q), len(np.unique(info.q_inds)))
+        self.assertTrue(np.all(np.isfinite(info.d_h)))
+        second = score.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, proposal, 1)
+        both = MarginalizationInfo(**{key: getattr(info, key) for key in [
+            "qmc_sequence_id", "ln_numerators", "q_inds", "o_inds", "sky_inds", "t_first_det", "d_h", "h_h",
+            "tdet_inds", "flip_psi", "proposals_n_qmc", "proposals"]})
+        both.update(second)
+        self.assertEqual(both.n_qmc, 2 ** (score.log2n_qmc + 1))
+        self.assertEqual(len(both.q_inds), len(info.q_inds) + len(second.q_inds))
+        # with the same proposal twice, the estimate is the mean of the two chunks' estimates
+        self.assertAlmostEqual(both.lnl_marginalized,
+                               np.logaddexp(info.lnl_marginalized, second.lnl_marginalized) - np.log(2))
+
+    @parameterized.expand(NETWORKS)
+    def test_kde_proposal(self, *names):
+        score = self.make_score(names, lnlike=gaussian_lnlike)
+        times = self.times(score.sky_dict)
+        dh_mptd, hh_mppd = self.peaked_time_series(len(names))
+        proposal = score.get_t_arrival_proposal(dh_mptd, hh_mppd)
+        info = score.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, proposal, 0)
+        kde = score.kde_t_arrival_prob(info, times)
+        self.assertEqual(kde.shape, proposal.shape)
+        np.testing.assert_allclose(kde.sum(axis=1), 1)
+        self.assertTrue(np.all(kde >= 0))
+
+    def test_adaptation_stops(self):
+        dh_mptd, hh_mppd = self.peaked_time_series(2)
+        # an unreachable effective sample size: every chunk of the sequence is used
+        score = self.make_score(("H1", "L1"), lnlike=gaussian_lnlike, min_n_effective=1e9)
+        times = self.times(score.sky_dict)
+        info = score.get_marginalization_info(dh_mptd, hh_mppd, times)
+        self.assertEqual(info.n_qmc, 2 ** score.max_log2n_qmc)
+        self.assertEqual(len(info.proposals), len(score._qmc_ind_chunks))
+        self.assertIsNone(score._t_arrival_prob)  # not remembered: the effective sample size stays below its minimum
+        # an estimate below the threshold: the loop stops at the first chunk after which the effective sample size
+        # exceeds 2
+        info = score.get_marginalization_info(dh_mptd, hh_mppd, times, lnl_marginalized_threshold=np.inf)
+        self.assertGreater(info.n_effective, 2)
+        self.assertLess(info.n_qmc, 2 ** score.max_log2n_qmc)
+        last_chunk = info.q_inds >= info.n_qmc - 2 ** score.log2n_qmc
+        if info.n_qmc > 2 ** score.log2n_qmc:  # without the last chunk the effective sample size was at most 2
+            earlier = MarginalizationInfo(
+                qmc_sequence_id=info.qmc_sequence_id, ln_numerators=info.ln_numerators[~last_chunk],
+                q_inds=info.q_inds[~last_chunk], o_inds=info.o_inds[~last_chunk],
+                sky_inds=info.sky_inds[~last_chunk], t_first_det=info.t_first_det[~last_chunk],
+                d_h=info.d_h[~last_chunk], h_h=info.h_h[~last_chunk], tdet_inds=info.tdet_inds[:, ~last_chunk],
+                flip_psi=info.flip_psi[~last_chunk], proposals_n_qmc=info.proposals_n_qmc[:-1],
+                proposals=info.proposals[:-1])
+            self.assertLessEqual(earlier.n_effective, 2)
+        # a reachable effective sample size: one chunk, and the proposal is remembered
+        score = self.make_score(("H1", "L1"), lnlike=gaussian_lnlike, min_n_effective=1)
+        info = score.get_marginalization_info(dh_mptd, hh_mppd, times)
+        self.assertEqual(len(info.proposals), 1)
+        np.testing.assert_allclose(score._t_arrival_prob, info.proposals[-1])
+
+    def test_optimize_beta_temperature(self):
+        score = self.make_score(("H1",), lnlike=gaussian_lnlike)
+        dh_mptd, hh_mppd = self.peaked_time_series(1)
+        score.optimize_beta_temperature(dh_mptd, hh_mppd, self.times(score.sky_dict))
+        self.assertEqual(score.beta_temperature.shape, (1,))
+        self.assertTrue(0.1 <= score.beta_temperature[0] <= 1)
+        self.assertEqual(score.min_n_effective, 50)
+
+
+class TestTimeGridPadding(unittest.TestCase):
+    """The padding of the time grid and the check of the linear-free time shift against its margin."""
+
+    @staticmethod
+    def make(time_padding=None):
+        cls = bilby.gw.likelihood.ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient
+        interferometers = bilby.gw.detector.InterferometerList(["H1", "L1"])
+        interferometers.set_strain_data_from_zero_noise(
+            sampling_frequency=SAMPLING_FREQUENCY, duration=DURATION, start_time=GEOCENT_TIME - DURATION + 2)
+        priors = dict(geocent_time=bilby.core.prior.Uniform(GEOCENT_TIME - 0.1, GEOCENT_TIME + 0.1))
+        likelihood = cls.__new__(cls)  # only the time grid is needed
+        likelihood.times, likelihood.time_padding = cls._get_time_grid(
+            interferometers, priors, make_waveform_generator(bilby.gw.source.lal_binary_black_hole), time_padding)
+        likelihood._largest_time_shift_warned = None
+        return likelihood
+
+    def test_default_padding_and_margin(self):
+        likelihood = self.make()
+        widened = 0.2 + 2 * bilby.core.utils.radius_of_earth / bilby.core.utils.speed_of_light
+        self.assertAlmostEqual(likelihood.time_padding, widened / 10)
+        self.assertAlmostEqual(likelihood.time_shift_margin, 0.04 * widened, delta=1e-3)
+
+    def test_check_time_shift(self):
+        likelihood = self.make()
+        self.assertTrue(likelihood.check_time_shift(0.5 * likelihood.time_shift_margin))
+        with self.assertLogs("bilby", level="WARNING") as logs:
+            self.assertFalse(likelihood.check_time_shift(-0.03))
+        self.assertIn("time_padding", logs.output[0])
+        # a smaller shift beyond the margin is not warned about again
+        with self.assertNoLogs("bilby", level="WARNING"):
+            self.assertFalse(likelihood.check_time_shift(0.02))
+        # the padding the warning names covers the shift
+        padded = self.make(time_padding=likelihood.required_time_padding(0.03))
+        self.assertAlmostEqual(padded.time_shift_margin, 0.03, delta=1e-3)
+        self.assertTrue(padded.check_time_shift(0.0299))
 
 
 if __name__ == "__main__":

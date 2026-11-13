@@ -10,10 +10,13 @@ At that time the latitude equals the declination and the longitude is the
 right ascension minus the Greenwich mean sidereal time.
 """
 import itertools
+from dataclasses import dataclass, field
 
 import numpy as np
 import scipy.signal
-from scipy.stats import qmc
+from scipy.interpolate import krogh_interpolate, make_interp_spline
+from scipy.special import logsumexp
+from scipy.stats import cauchy, qmc
 
 from ...core.utils import logger, speed_of_light
 from ..geometry import get_polarization_tensor
@@ -348,6 +351,128 @@ class SkyDictionary:
         return np.log(prior_t2 + 1e-10)
 
 
+def n_effective(weights):
+    """The effective sample size, :math:`(\\sum w)^2 / \\sum w^2`, as cogwheel's :code:`utils.n_effective`."""
+    weights = np.asarray(weights)
+    if weights.size == 0:
+        return 0.
+    return np.sum(weights) ** 2 / np.sum(weights ** 2)
+
+
+@dataclass
+class MarginalizationInfo:
+    """
+    The result of one marginalization over the extrinsic parameters, as
+    cogwheel's :code:`MarginalizationInfo` and :code:`MarginalizationInfoHM`:
+    the kept (sample, phase) pairs, the inner products and the proposals
+    they were drawn from, and the derived weights, effective sample size
+    and marginalized likelihood.
+
+    The estimate is arXiv:2404.02435 Eqs. 31-32 (multiple importance
+    sampling with the balance heuristic):
+
+    .. math::
+
+        \\hat L = \\sum_{(q, o)} \\frac{\\exp(\\text{ln\\_numerators}_{qo})}
+        {\\sum_j n_j \\prod_I P_{j,I}(\\tau_{qI})}
+
+    with :math:`n_j` the number of samples drawn from proposal :math:`P_j`,
+    counting the samples dropped by the physical mask or by the time prior.
+
+    Attributes
+    ----------
+    qmc_sequence_id: int
+        Index of the QMC sequence used.
+    ln_numerators: array_like
+        For each kept pair: log of the likelihood marginalized over
+        distance, plus the log of the sky and time prior factor, minus the
+        log of the number of orbital phases.
+    q_inds, o_inds: array_like
+        For each kept pair: index in the QMC sequence and of the orbital
+        phase.
+    sky_inds: array_like
+        For each kept pair: index of the sky location in the sky dictionary.
+    t_first_det: array_like
+        For each kept pair: arrival time at the first interferometer (s,
+        on the scale of the time grid).
+    d_h, h_h: array_like
+        For each kept pair: the real :math:`\\langle d|h\\rangle` and
+        :math:`\\langle h|h\\rangle` of the network.
+    tdet_inds: array_like
+        Of shape (interferometer, kept pair): arrival-time indices.
+    flip_psi: array_like
+        Boolean, for each kept pair: whether :math:`\\langle d|h\\rangle < 0`.
+    proposals_n_qmc: list
+        Number of samples drawn from each proposal.
+    proposals: list
+        Each proposal, of shape (interferometer, time), rows summing to one.
+    weights: array_like
+        Normalized importance weights of the kept pairs.
+    weights_q: array_like
+        Normalized weights summed over the orbital phases of each sample,
+        the nonzero ones.
+    n_qmc: int
+        Number of samples drawn, including those dropped.
+    n_effective: float
+        Effective sample size of :code:`weights_q`.
+    lnl_marginalized: float
+        Log of the likelihood marginalized over the extrinsic parameters;
+        :code:`-inf` if no pair is kept.
+    """
+    qmc_sequence_id: int
+    ln_numerators: np.ndarray
+    q_inds: np.ndarray
+    o_inds: np.ndarray
+    sky_inds: np.ndarray
+    t_first_det: np.ndarray
+    d_h: np.ndarray
+    h_h: np.ndarray
+    tdet_inds: np.ndarray
+    flip_psi: np.ndarray
+    proposals_n_qmc: list
+    proposals: list
+
+    weights: np.ndarray = field(init=False)
+    weights_q: np.ndarray = field(init=False)
+    n_qmc: int = field(init=False)
+    n_effective: float = field(init=False)
+    lnl_marginalized: float = field(init=False)
+
+    def __post_init__(self):
+        """Set the derived attributes, as cogwheel's :code:`MarginalizationInfo.__post_init__`."""
+        self.n_qmc = sum(self.proposals_n_qmc)
+        if self.q_inds.size == 0:
+            self.weights = np.array([])
+            self.weights_q = np.array([])
+            self.n_effective = 0.
+            self.lnl_marginalized = -np.inf
+            return
+        denominators = np.zeros(len(self.q_inds))
+        for n_qmc, proposal in zip(self.proposals_n_qmc, self.proposals):
+            denominators += n_qmc * np.prod(np.take_along_axis(proposal, self.tdet_inds, axis=1), axis=0)
+        ln_weights = self.ln_numerators - np.log(denominators)
+        self.weights = exp_normalize(ln_weights)
+        weights_q = np.bincount(self.q_inds, weights=self.weights)  # the phases of each sample summed
+        self.weights_q = weights_q[weights_q > 0]
+        self.n_effective = n_effective(self.weights_q)
+        self.lnl_marginalized = logsumexp(ln_weights)
+
+    def update(self, other):
+        """
+        Add the pairs of :code:`other`, from a later chunk of the same QMC
+        sequence, and recompute the derived attributes, as cogwheel's
+        :code:`MarginalizationInfo.update`.
+        """
+        if self.qmc_sequence_id != other.qmc_sequence_id:
+            raise ValueError("Cannot use different QMC sequences.")
+        self.proposals_n_qmc = self.proposals_n_qmc + other.proposals_n_qmc
+        self.proposals = self.proposals + other.proposals
+        for attribute in ("ln_numerators", "q_inds", "o_inds", "sky_inds", "t_first_det", "d_h", "h_h",
+                          "tdet_inds", "flip_psi"):
+            setattr(self, attribute, np.concatenate([getattr(self, attribute), getattr(other, attribute)], axis=-1))
+        self.__post_init__()
+
+
 class CoherentScore:
     """
     The likelihood marginalized over the extrinsic parameters, from the
@@ -400,11 +525,38 @@ class CoherentScore:
         cogwheel. Default is 128.
     seed: int, optional
         Seed of the QMC sequences. Default is 0.
+    min_n_effective: float, optional
+        The adaptive importance sampling adds chunks of the QMC sequence
+        until the effective sample size reaches this. Default is 50, as
+        cogwheel.
+    ln_time_prior: callable, optional
+        :code:`f(t_geocenter)`, the log of the normalized prior density
+        (1/s) of the arrival time at the geocenter, vectorized, with
+        :code:`t_geocenter` on the scale of the time grid passed to
+        :code:`get_marginalization_info`. With it, each sample's numerator
+        carries this density and samples where it is :code:`-inf` are
+        dropped, so that :code:`lnl_marginalized` estimates the likelihood
+        averaged over a normalized prior of every extrinsic parameter.
+        Default is :code:`None`: cogwheel's convention, a time prior of 1
+        per second over the time grid (arXiv:2404.02435 Eqs. 27-28), so that
+        the estimate exceeds the normalized one by the log of the width of
+        the time prior in seconds
+        (research/extrinsic-marginalization/2026-11-11_normalization-audit.md).
+
+    Notes
+    -----
+    The other factors of the estimate are normalized as in cogwheel: the
+    sky prior factor :math:`\\Delta \\Pi(\\delta\\tau)` of each sample, with
+    :math:`\\Delta` the cell width and :math:`\\Pi` the fraction of the sky
+    dictionary's locations in the cell; the polarization drawn from its
+    uniform prior on (0, pi); the average over :code:`nphi` orbital phases;
+    and the likelihood marginalized over distance with its normalized prior
+    (:code:`lnlike_marginalized_over_distance`).
     """
 
     def __init__(self, sky_dict, m_arr, lnlike_marginalized_over_distance, nphi=128, dlnl_threshold=12.,
                  beta_temperature=0.5, learning_rate=1e-2, log2n_qmc=11, max_log2n_qmc=15, n_qmc_sequences=128,
-                 seed=0):
+                 seed=0, min_n_effective=50, ln_time_prior=None):
         if max_log2n_qmc < log2n_qmc:
             raise ValueError("max_log2n_qmc < log2n_qmc")
         self.sky_dict = sky_dict
@@ -416,6 +568,8 @@ class CoherentScore:
         self.dlnl_threshold = dlnl_threshold
         self.beta_temperature = np.asarray(beta_temperature)
         self.learning_rate = learning_rate
+        self.min_n_effective = min_n_effective
+        self.ln_time_prior = ln_time_prior
         self._t_arrival_prob = None
         self.log2n_qmc = log2n_qmc
         self.max_log2n_qmc = max_log2n_qmc
@@ -725,3 +879,215 @@ class CoherentScore:
         return dict(n_qmc=n_qmc, physical_mask=physical_mask, q_inds=q_inds, tdet_inds=tdet_inds,
                     sky_inds=sky_inds, sky_prior=sky_prior, t_first_det=t_first_det,
                     psi=self._qmc_sequence["psi"][q_inds])
+
+    def get_fplus_fcross(self, sky_inds, q_inds):
+        """
+        Return the antenna patterns of the samples, of shape (sample,
+        interferometer, polarization), at their sky locations and
+        polarizations, as cogwheel's :code:`BaseCoherentScore._get_fplus_fcross`.
+        """
+        fplus_fcross_0 = self.sky_dict.fplus_fcross_0[sky_inds]
+        rot_psi = self._qmc_sequence["rot_psi"][q_inds]
+        return (rot_psi[:, np.newaxis] @ fplus_fcross_0[..., np.newaxis])[..., 0]
+
+    @staticmethod
+    def interp_locally(times, timeseries, new_times, spline_degree=3):
+        """
+        Interpolate :code:`timeseries` along its last axis at
+        :code:`new_times` with a spline through the points that span them,
+        as cogwheel's :code:`BaseCoherentScore._interp_locally`; with too few
+        points, an interpolating polynomial.
+        """
+        t_rng = new_times.min(), new_times.max()
+        i_min, i_max = np.clip(np.searchsorted(times, t_rng) + (-1, 1), 0, len(times) - 1)
+        if i_max - i_min > spline_degree:
+            return make_interp_spline(times[i_min:i_max], timeseries[..., i_min:i_max], k=spline_degree,
+                                      check_finite=False, axis=-1)(new_times)
+        if i_min == i_max:
+            return timeseries[..., (i_min,) * len(new_times)]
+        return krogh_interpolate(times[i_min:i_max], timeseries[..., i_min:i_max], new_times, axis=-1)
+
+    def get_marginalization_info_chunk(self, dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk):
+        """
+        Draw the samples of chunk :code:`i_chunk` of the current QMC
+        sequence from :code:`t_arrival_prob` and return their
+        :code:`MarginalizationInfo`, as cogwheel's
+        :code:`CoherentScoreHM._get_marginalization_info_chunk`. With
+        :code:`ln_time_prior`, samples whose arrival time at the geocenter
+        has zero prior density are dropped and the density enters the
+        numerators of the others.
+
+        Parameters
+        ----------
+        dh_mptd: array_like
+            Complex :math:`\\langle d|h_{m,p}\\rangle` on :code:`times`, of
+            shape (harmonic, polarization, time, interferometer).
+        hh_mppd: array_like
+            Complex :math:`\\langle h_{m,p}|h_{m',p'}\\rangle`, of shape (pair,
+            polarization, polarization, interferometer).
+        times: array_like
+            The time grid, of spacing :code:`1 / sky_dict.f_sampling` (s).
+        t_arrival_prob: array_like
+            The proposal, of shape (interferometer, time), rows summing to one.
+        i_chunk: int
+            Index into the chunks of the QMC sequence.
+
+        Returns
+        -------
+        MarginalizationInfo
+        """
+        draws = self.draw_extrinsic_samples(t_arrival_prob, times, i_chunk)
+        q_inds, tdet_inds, t_first_det = draws["q_inds"], draws["tdet_inds"], draws["t_first_det"]
+        sky_inds, sky_prior = np.asarray(draws["sky_inds"], dtype=int), draws["sky_prior"]
+        if self.ln_time_prior is not None and len(q_inds) > 0:
+            # The time prior: arXiv:2404.02435 Eq. 27 with pi(t_geocenter) normalized, not 1 per second
+            ln_time_prior = np.asarray(self.ln_time_prior(
+                t_first_det - self.sky_dict.geocenter_delay_first_det[sky_inds]), dtype=float)
+            inside = ln_time_prior > -np.inf
+            q_inds, tdet_inds, t_first_det, sky_inds = (
+                q_inds[inside], tdet_inds[:, inside], t_first_det[inside], sky_inds[inside])
+            sky_prior = sky_prior[inside] * np.exp(ln_time_prior[inside])
+        if len(q_inds) == 0:
+            return MarginalizationInfo(
+                qmc_sequence_id=self._current_qmc_sequence_id, ln_numerators=np.array([]),
+                q_inds=np.array([], int), o_inds=np.array([], int), sky_inds=np.array([], int),
+                t_first_det=np.array([]), d_h=np.array([]), h_h=np.array([]), tdet_inds=tdet_inds,
+                flip_psi=np.array([], bool), proposals_n_qmc=[draws["n_qmc"]], proposals=[t_arrival_prob])
+
+        fplus_fcross = self.get_fplus_fcross(sky_inds, q_inds)
+        t_det = np.vstack((t_first_det, t_first_det + self.sky_dict.delays[:, sky_inds]))
+        dh_dmpq = np.array([self.interp_locally(times, dh_mptd[..., i_det], t_det[i_det])
+                            for i_det in range(len(self.sky_dict.detector_names))])
+        dh_qo, hh_qo = self.get_dh_hh_qo(fplus_fcross, dh_dmpq, hh_mppd)
+        ln_numerators, important, flip_psi = self.get_lnnumerators_important_flippsi(dh_qo, hh_qo, sky_prior)
+        return MarginalizationInfo(
+            qmc_sequence_id=self._current_qmc_sequence_id, ln_numerators=ln_numerators,
+            q_inds=q_inds[important[0]], o_inds=important[1], sky_inds=sky_inds[important[0]],
+            t_first_det=t_first_det[important[0]], d_h=dh_qo[important], h_h=hh_qo[important],
+            tdet_inds=tdet_inds[:, important[0]], flip_psi=flip_psi, proposals_n_qmc=[draws["n_qmc"]],
+            proposals=[t_arrival_prob])
+
+    def kde_t_arrival_prob(self, marginalization_info, times):
+        """
+        Return a proposal of arrival times, of shape (interferometer, time),
+        rows summing to one, from a kernel density estimate of the weighted
+        samples so far: their histogram convolved with a Cauchy kernel of
+        scale Silverman's factor times their standard deviation, at least
+        one cell, as cogwheel's :code:`BaseCoherentScore._kde_t_arrival_prob`
+        (arXiv:2404.02435 Sec. II D 2).
+        """
+        info = marginalization_info
+        delays = self.sky_dict.delays[:, info.sky_inds]
+        t_det = np.vstack((info.t_first_det, info.t_first_det + delays))
+        silverman_factor = (3 / 4 * info.n_effective) ** -.2
+        dt = times[1] - times[0]
+        bins = np.concatenate([[-np.inf], times[:-1] + dt / 2, [np.inf]])
+        prob = []
+        for t_samples in t_det:
+            hist = np.histogram(t_samples, weights=info.weights, bins=bins)[0]
+            average = np.average(t_samples, weights=info.weights)
+            std = np.sqrt(np.average((t_samples - average) ** 2, weights=info.weights))
+            scale = max(dt, silverman_factor * std)
+            kernel = cauchy.pdf(times, loc=times[(len(times) - 1) // 2], scale=scale)
+            prob.append(scipy.signal.convolve(hist, kernel, mode="same"))
+        prob = np.array(prob)
+        return prob / prob.sum(axis=1, keepdims=True)
+
+    def adapt_marginalization_info(self, dh_mptd, hh_mppd, times, t_arrival_prob,
+                                   lnl_marginalized_threshold=-np.inf):
+        """
+        Run the adaptive importance sampling on the next QMC sequence, as
+        cogwheel's :code:`BaseCoherentScore._get_marginalization_info`
+        (arXiv:2404.02435 Eqs. 30-33, Sec. A8): after each chunk, while the
+        effective sample size is below :code:`min_n_effective`, mix half the
+        kernel density estimate of the samples with half the last proposal
+        and draw the next chunk from it. It stops at the last chunk, when no
+        sample is kept, or, once the effective sample size exceeds 2, when
+        :code:`lnl_marginalized` is below :code:`lnl_marginalized_threshold`.
+
+        Returns
+        -------
+        MarginalizationInfo
+        """
+        self.switch_qmc_sequence()
+        i_chunk = 0
+        info = self.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk)
+        while info.n_effective < self.min_n_effective:
+            i_chunk += 1
+            if i_chunk == len(self._qmc_ind_chunks):
+                logger.debug("Maximum QMC resolution reached.")
+                break
+            if info.n_effective == 0:
+                break
+            if info.n_effective > 2 and info.lnl_marginalized < lnl_marginalized_threshold:
+                break
+            t_arrival_prob = .5 * (self.kde_t_arrival_prob(info, times) + t_arrival_prob)
+            info.update(self.get_marginalization_info_chunk(dh_mptd, hh_mppd, times, t_arrival_prob, i_chunk))
+        return info
+
+    def get_marginalization_info(self, dh_mptd, hh_mppd, times, lnl_marginalized_threshold=-np.inf):
+        """
+        Return the likelihood marginalized over the extrinsic parameters,
+        with its samples, as cogwheel's
+        :code:`ProposingCoherentScore.get_marginalization_info`: resample the
+        time series to the sky dictionary's sampling frequency, build the
+        arrival-time proposal (:code:`get_t_arrival_proposal`), run the
+        adaptive importance sampling (:code:`adapt_marginalization_info`)
+        and, if the effective sample size exceeds :code:`min_n_effective`,
+        remember the last proposal (:code:`remember_t_arrival_proposal`).
+
+        Parameters
+        ----------
+        dh_mptd: array_like
+            Complex :math:`\\langle d|h_{m,p}\\rangle` on :code:`times`, of
+            shape (harmonic, polarization, time, interferometer).
+        hh_mppd: array_like
+            Complex :math:`\\langle h_{m,p}|h_{m',p'}\\rangle`, of shape (pair,
+            polarization, polarization, interferometer).
+        times: array_like
+            The time grid of :code:`dh_mptd` (s), evenly spaced.
+        lnl_marginalized_threshold: float, optional
+            Stop adapting when the estimate falls below this, see
+            :code:`adapt_marginalization_info`. Default is :code:`-inf`.
+
+        Returns
+        -------
+        MarginalizationInfo
+        """
+        dh_mptd, times = self.sky_dict.resample_timeseries(dh_mptd, times, axis=-2)
+        t_arrival_prob = self.get_t_arrival_proposal(dh_mptd, hh_mppd)
+        info = self.adapt_marginalization_info(dh_mptd, hh_mppd, times, t_arrival_prob, lnl_marginalized_threshold)
+        if self.learning_rate and info.n_effective > self.min_n_effective:
+            self.remember_t_arrival_proposal(info.proposals[-1])
+        return info
+
+    def optimize_beta_temperature(self, dh_mptd, hh_mppd, times, beta_rng=(.1, 1)):
+        """
+        Set :code:`beta_temperature`, one value per interferometer, to
+        minimize the number of samples per effective sample, as cogwheel's
+        :code:`ProposingCoherentScore.optimize_beta_temperature`: two passes
+        over the interferometers, each trying 100 values spaced
+        geometrically over :code:`beta_rng`, with :code:`min_n_effective`
+        set to zero, and taking the minimum of the cost smoothed by a
+        Savitzky-Golay filter. Each trial runs
+        :code:`get_marginalization_info`, so it also updates the remembered
+        proposal, as in cogwheel.
+        """
+        number = len(self.sky_dict.detector_names)
+        beta_temperature = np.array(np.broadcast_to(self.beta_temperature, number), dtype=float)
+        betas = np.geomspace(*beta_rng, 100)
+        saved = self.beta_temperature, self.min_n_effective
+        try:
+            self.beta_temperature, self.min_n_effective = beta_temperature, 0
+            for _ in range(2):
+                for i_det in range(number):
+                    cost = []
+                    for beta in betas:
+                        beta_temperature[i_det] = beta
+                        info = self.get_marginalization_info(dh_mptd, hh_mppd, times)
+                        cost.append(info.n_qmc / (info.n_effective + 1e-3))
+                    cost_smooth = scipy.signal.savgol_filter(cost, len(cost) // 10, 1, mode="nearest")
+                    beta_temperature[i_det] = betas[np.argmin(cost_smooth)]
+        finally:
+            self.beta_temperature, self.min_n_effective = saved
+        self.beta_temperature = beta_temperature
