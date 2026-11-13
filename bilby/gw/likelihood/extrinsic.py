@@ -1,8 +1,19 @@
+import copy
+
 import numpy as np
 
+from .coherent_score import CoherentScore, SkyDictionary
 from .relative_modes import ModeByModeRelativeBinningGravitationalWaveTransient
-from ...core.prior import Uniform
+from ...core.prior import Cosine, Uniform
 from ...core.utils import logger, radius_of_earth, speed_of_light
+
+# The extrinsic parameters marginalized by the class besides the distance, and the prior each must have: the sky
+# isotropic (right ascension uniform on (0, 2 pi) and declination with a cosine density, which at the fixed reference
+# GPS time is cogwheel's isotropic prior in Earth-fixed longitude and latitude), polarization uniform on (0, pi),
+# orbital phase uniform on (0, 2 pi) and geocentric arrival time uniform
+_MARGINALIZED_PRIORS = dict(
+    ra=(Uniform, 0, 2 * np.pi), dec=(Cosine, -np.pi / 2, np.pi / 2), psi=(Uniform, 0, np.pi),
+    phase=(Uniform, 0, 2 * np.pi), geocent_time=(Uniform, None, None))
 
 
 class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
@@ -13,6 +24,15 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
     Roulet, Mushkin et al., arXiv:2404.02435, and its implementation in
     cogwheel, on top of the mode-by-mode relative binning of
     :code:`ModeByModeRelativeBinningGravitationalWaveTransient`.
+
+    The log likelihood ratio it returns is the log of the likelihood
+    averaged over the normalized priors of right ascension, declination,
+    polarization, orbital phase, geocentric arrival time and luminosity
+    distance, estimated by adaptive importance sampling
+    (:code:`CoherentScore`). The sampler's evidence over the remaining
+    parameters is then the full evidence. The estimate is stochastic: two
+    calls with the same parameters use different QMC sequences and can
+    differ.
 
     For each interferometer, harmonic m and polarization, the inner product
     of the data with the waveform is computed on a grid of arrival times at
@@ -34,8 +54,15 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         :func:`bilby.gw.source.lal_binary_black_hole_relative_binning_by_mode`
         or another source model with the same output.
     priors: dict
-        Must contain a :code:`Uniform` prior on :code:`geocent_time`, whose
-        range sets the grid of arrival times.
+        Must contain :code:`Uniform` priors on :code:`ra` over (0, 2 pi),
+        :code:`psi` over (0, pi), :code:`phase` over (0, 2 pi) and
+        :code:`geocent_time` (whose range sets the grid of arrival times), a
+        :code:`Cosine` prior on :code:`dec` over (-pi/2, pi/2), and a prior on
+        :code:`luminosity_distance`. These six are marginalized: they are
+        replaced by fixed values in :code:`priors`, as bilby's distance
+        marginalization does, and listed in :code:`_marginalized_parameters`.
+    distance_marginalization_lookup_table: (dict, str), optional
+        See :code:`GravitationalWaveTransient`.
     fiducial_parameters: dict, optional
         See :code:`ModeByModeRelativeBinningGravitationalWaveTransient`.
     chi: float, optional
@@ -64,6 +91,34 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         every arrival time of the prior only while the linear-free time
         shift is at most :code:`time_shift_margin`; see
         :code:`check_time_shift`.
+    reject_low_n_effective: bool, optional
+        Whether to return a log likelihood ratio of :code:`-inf` when the
+        effective sample size of the importance sampling is below 2, or below
+        10 for an estimate above the largest returned so far, as cogwheel's
+        :code:`MarginalizedExtrinsicLikelihood.lnlike_and_metadata`. This
+        removes those points from the evidence; the number of rejections is
+        kept in :code:`number_of_rejections` and logged. Default is
+        :code:`True`, as cogwheel.
+    dlnl_marginalized_threshold: float, optional
+        In nats. The adaptation of the proposal stops for a point whose
+        estimate is more than this below the largest returned so far, once
+        its effective sample size exceeds 2 (arXiv:2404.02435 Sec. A8). The
+        estimate is returned, not set to :code:`-inf`. Default is 30, as
+        cogwheel.
+    optimize_beta_temperature: bool, optional
+        Whether to tune the tempering of the arrival-time proposal per
+        interferometer at the fiducial parameters on construction, as
+        cogwheel (:code:`CoherentScore.optimize_beta_temperature`). Default
+        is :code:`True`.
+    coherent_score_kwargs: dict, optional
+        Further keyword arguments of :code:`CoherentScore`, such as
+        :code:`nphi`, :code:`log2n_qmc`, :code:`max_log2n_qmc`,
+        :code:`n_qmc_sequences`, :code:`min_n_effective`,
+        :code:`learning_rate`, :code:`beta_temperature` and :code:`seed`.
+    sky_dictionary_kwargs: dict, optional
+        Keyword arguments of :code:`SkyDictionary`, such as :code:`nsky`
+        and :code:`seed`; :code:`f_sampling` defaults to the multiple of the
+        time series' sampling frequency closest to 8192 Hz.
 
     Notes
     -----
@@ -80,8 +135,21 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
                  safe_fiducial_parameters=True,
                  linear_free=True,
                  dlnl_threshold=12.,
-                 time_padding=None):
+                 time_padding=None,
+                 distance_marginalization_lookup_table=None,
+                 reject_low_n_effective=True,
+                 dlnl_marginalized_threshold=30.,
+                 optimize_beta_temperature=True,
+                 coherent_score_kwargs=None,
+                 sky_dictionary_kwargs=None):
+        self._check_extrinsic_priors(priors)
         self.dlnl_threshold = dlnl_threshold
+        self.reject_low_n_effective = reject_low_n_effective
+        self.dlnl_marginalized_threshold = dlnl_marginalized_threshold
+        self.number_of_rejections = 0
+        self._max_lnl_marginalized = -np.inf
+        self.marginalization_info = None
+        self.coherent_score = None  # made after the parent's construction
         self.times, self.time_padding = self._get_time_grid(
             interferometers, priors, waveform_generator, time_padding)
         self._largest_time_shift_warned = None
@@ -97,7 +165,125 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
             chi=chi,
             epsilon=epsilon,
             spline_degree=spline_degree,
-            safe_fiducial_parameters=safe_fiducial_parameters)
+            safe_fiducial_parameters=safe_fiducial_parameters,
+            distance_marginalization=True,
+            distance_marginalization_lookup_table=distance_marginalization_lookup_table)
+
+        # Fix the marginalized parameters in the priors passed in, as GravitationalWaveTransient does for the distance
+        for key in _MARGINALIZED_PRIORS:
+            priors[key] = 0.0 if key != "geocent_time" else float(np.mean(
+                [self.priors["geocent_time"].minimum, self.priors["geocent_time"].maximum]))
+            self._marginalized_parameters.append(key)
+
+        sky_dictionary_kwargs = dict(sky_dictionary_kwargs or dict())
+        sky_dictionary_kwargs.setdefault(
+            "f_sampling", SkyDictionary.choose_f_sampling(self.waveform_generator.frequency_array[-1]))
+        mode_array = self.waveform_generator.waveform_arguments.get(
+            "mode_array", [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4]])
+        m_arr = list(dict.fromkeys(int(mode[1]) for mode in mode_array))
+        self.coherent_score = CoherentScore(
+            SkyDictionary(self.interferometers, **sky_dictionary_kwargs), m_arr,
+            self._lnlike_marginalized_over_distance, dlnl_threshold=dlnl_threshold,
+            ln_time_prior=self._ln_time_prior, **(coherent_score_kwargs or dict()))
+
+        if optimize_beta_temperature:
+            d_inner_h, h_inner_h, time_shift = self.get_time_series_inner_products(
+                self.waveform_generator.frequency_domain_strain(self._waveform_parameters(self.fiducial_parameters)))
+            self.coherent_score.optimize_beta_temperature(d_inner_h, h_inner_h, self.times - time_shift)
+        self.log_likelihood_ratio(self.fiducial_parameters)  # sets the largest estimate so far, as cogwheel
+
+    @staticmethod
+    def _check_extrinsic_priors(priors):
+        """
+        Raise a ValueError unless the priors of the marginalized parameters
+        are those the marginalization assumes (see the class).
+        """
+        if priors is None:
+            raise ValueError("Priors are required.")
+        for key, (prior_class, minimum, maximum) in _MARGINALIZED_PRIORS.items():
+            prior = priors.get(key)
+            if not isinstance(prior, prior_class) or (
+                    minimum is not None and not np.allclose([prior.minimum, prior.maximum], [minimum, maximum])):
+                bounds = "" if minimum is None else f" over ({minimum:.6g}, {maximum:.6g})"
+                raise ValueError(f"The marginalization requires a {prior_class.__name__} prior on {key}{bounds}.")
+        if "luminosity_distance" not in priors and not any(key in priors for key in ["redshift", "comoving_distance"]):
+            raise ValueError("A prior on luminosity_distance is required.")
+
+    def _ln_time_prior(self, t_geocenter):
+        """
+        The log of the :code:`geocent_time` prior's density (1/s) at
+        geocentric arrival times given relative to the start time of the
+        data, as the time grid; :code:`-inf` outside the prior. This is the
+        time-prior term of the normalized estimate
+        (research/extrinsic-marginalization/2026-11-11_normalization-audit.md).
+        """
+        with np.errstate(divide="ignore"):
+            return np.asarray(self.priors["geocent_time"].ln_prob(
+                np.asarray(t_geocenter) + self.interferometers.start_time), dtype=float)
+
+    def _lnlike_marginalized_over_distance(self, d_inner_h, h_inner_h):
+        """
+        The log of the likelihood marginalized over distance with its
+        normalized prior, from bilby's lookup table, for real inner products
+        of the waveform generated at the table's reference distance.
+        """
+        return self._interp_dist_margd_loglikelihood(d_inner_h, h_inner_h)
+
+    def _waveform_parameters(self, parameters):
+        """The parameters with the distance at the table's reference distance and the orbital phase at 0."""
+        parameters = copy.deepcopy(dict(parameters))
+        parameters.update(luminosity_distance=float(self._ref_dist), phase=0.0)
+        return parameters
+
+    def reject(self, marginalization_info):
+        """
+        Whether to return :code:`-inf` for this estimate: if its effective
+        sample size is below 2, or below 10 when the estimate exceeds the
+        largest returned so far, as cogwheel's
+        :code:`MarginalizedExtrinsicLikelihood.lnlike_and_metadata`.
+        """
+        n_effective = marginalization_info.n_effective
+        return n_effective < 2 or (
+            marginalization_info.lnl_marginalized > self._max_lnl_marginalized and n_effective < 10)
+
+    def log_likelihood_ratio(self, parameters):
+        """
+        Return the log of the likelihood ratio averaged over the normalized
+        priors of the six marginalized parameters, estimated by
+        :code:`CoherentScore.get_marginalization_info`; the values of those
+        six in :code:`parameters` are ignored. The estimate's
+        :code:`MarginalizationInfo` is kept in :code:`marginalization_info`.
+        With :code:`reject_low_n_effective`, a rejected estimate returns the
+        most negative float, as bilby does for a failed waveform.
+        """
+        if self.coherent_score is None:
+            # During the parent's construction (it logs the fiducial likelihood, relative.py), before the coherent
+            # score exists: the parent's likelihood, marginalized over distance only
+            return super().log_likelihood_ratio(parameters)
+        waveform_polarizations = self.waveform_generator.frequency_domain_strain(
+            self._waveform_parameters(parameters))
+        if waveform_polarizations is None:
+            return np.nan_to_num(-np.inf)
+        d_inner_h, h_inner_h, time_shift = self.get_time_series_inner_products(waveform_polarizations)
+        self.check_time_shift(time_shift)
+        info = self.coherent_score.get_marginalization_info(
+            d_inner_h, h_inner_h, self.times - time_shift,
+            lnl_marginalized_threshold=self._max_lnl_marginalized - self.dlnl_marginalized_threshold)
+        self.marginalization_info = info
+        if self.reject_low_n_effective and self.reject(info):
+            self.number_of_rejections += 1
+            if self.number_of_rejections & (self.number_of_rejections - 1) == 0:  # 1, 2, 4, 8, ...
+                logger.warning(
+                    f"Rejected an estimate of {info.lnl_marginalized:.2f} with effective sample size "
+                    f"{info.n_effective:.2f}; {self.number_of_rejections} rejections so far.")
+            return np.nan_to_num(-np.inf)
+        self._max_lnl_marginalized = max(self._max_lnl_marginalized, info.lnl_marginalized)
+        return float(info.lnl_marginalized)
+
+    def generate_posterior_sample_from_marginalized_likelihood(self, parameters):
+        """Not implemented yet: drawing the marginalized parameters is block 9 of the port."""
+        raise NotImplementedError(
+            "Drawing the marginalized extrinsic parameters is not implemented yet.")
 
     @staticmethod
     def _get_time_grid(interferometers, priors, waveform_generator, time_padding=None):

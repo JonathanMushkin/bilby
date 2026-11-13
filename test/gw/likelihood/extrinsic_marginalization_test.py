@@ -1,5 +1,10 @@
+import logging
+import os
+import tempfile
 import unittest
 from copy import deepcopy
+from types import SimpleNamespace
+from unittest import mock
 
 import bilby
 import numpy as np
@@ -33,7 +38,7 @@ WAVEFORM_ARGUMENTS = dict(
 )
 INJECTION = dict(
     chirp_mass=30.0, mass_ratio=0.5, a_1=0.5, a_2=0.3, tilt_1=1.0, tilt_2=2.0, phi_12=1.0, phi_jl=0.5,
-    theta_jn=0.8, psi=0.5, phase=1.3, ra=1.3, dec=-1.2, geocent_time=GEOCENT_TIME, luminosity_distance=1000.0)
+    theta_jn=0.8, psi=0.5, phase=1.3, ra=1.3, dec=-1.2, geocent_time=GEOCENT_TIME, luminosity_distance=1640.0)  # unbinned ln L about 100 nats in H1-L1
 
 
 def make_waveform_generator(source_model):
@@ -43,9 +48,23 @@ def make_waveform_generator(source_model):
         waveform_arguments=deepcopy(WAVEFORM_ARGUMENTS))
 
 
-def make_likelihood(interferometer_names=("H1", "L1"), epsilon=0.05, linear_free=True):
+def make_priors():
+    priors = bilby.gw.prior.BBHPriorDict()
+    priors["geocent_time"] = bilby.core.prior.Uniform(GEOCENT_TIME - 0.1, GEOCENT_TIME + 0.1)
+    return priors
+
+
+LOOKUP_TABLE = os.path.join(tempfile.gettempdir(), "extrinsic_marginalization_test_distance_lookup.npz")
+
+
+def make_likelihood(interferometer_names=("H1", "L1"), epsilon=0.05, linear_free=True, priors=None, **kwargs):
     """Inject :code:`INJECTION` into zero noise and return the extrinsic-marginalized likelihood with the
-    injection as fiducial parameters, and the interferometers."""
+    injection as fiducial parameters, and the interferometers. By default the proposal is not tuned and the sky
+    dictionary has 10^5 locations, to keep the tests fast; the distance lookup table is cached in the temporary
+    directory."""
+    kwargs.setdefault("optimize_beta_temperature", False)
+    kwargs.setdefault("sky_dictionary_kwargs", dict(nsky=10 ** 5))
+    kwargs.setdefault("distance_marginalization_lookup_table", LOOKUP_TABLE)
     interferometers = bilby.gw.detector.InterferometerList(list(interferometer_names))
     interferometers.set_strain_data_from_zero_noise(
         sampling_frequency=SAMPLING_FREQUENCY, duration=DURATION, start_time=GEOCENT_TIME - DURATION + 2)
@@ -54,12 +73,11 @@ def make_likelihood(interferometer_names=("H1", "L1"), epsilon=0.05, linear_free
     interferometers.inject_signal(
         waveform_generator=make_waveform_generator(bilby.gw.source.lal_binary_black_hole),
         parameters=INJECTION, raise_error=False)
-    priors = bilby.gw.prior.BBHPriorDict()
-    priors["geocent_time"] = bilby.core.prior.Uniform(GEOCENT_TIME - 0.1, GEOCENT_TIME + 0.1)
+    priors = make_priors() if priors is None else priors
     likelihood = bilby.gw.likelihood.ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         interferometers=interferometers,
         waveform_generator=make_waveform_generator(bilby.gw.source.lal_binary_black_hole_relative_binning_by_mode),
-        priors=priors, fiducial_parameters=dict(INJECTION), epsilon=epsilon, linear_free=linear_free)
+        priors=priors, fiducial_parameters=dict(INJECTION), epsilon=epsilon, linear_free=linear_free, **kwargs)
     return likelihood, interferometers
 
 
@@ -692,6 +710,118 @@ class TestTimeGridPadding(unittest.TestCase):
         padded = self.make(time_padding=likelihood.required_time_padding(0.03))
         self.assertAlmostEqual(padded.time_shift_margin, 0.03, delta=1e-3)
         self.assertTrue(padded.check_time_shift(0.0299))
+
+
+class TestLikelihoodClass(unittest.TestCase):
+    """The wiring of the likelihood class: its priors, the marginalized
+    parameters, the estimate it returns and the rejection rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.priors = make_priors()
+        cls.likelihood, cls.interferometers = make_likelihood(
+            priors=cls.priors, coherent_score_kwargs=dict(n_qmc_sequences=4, learning_rate=0.0))
+
+    def call_on_sequence(self, parameters, sequence=0):
+        score = self.likelihood.coherent_score
+        score.sky_dict.set_generators()
+        score._current_qmc_sequence_id = (sequence - 1) % score.n_qmc_sequences  # the call moves to `sequence`
+        return self.likelihood.log_likelihood_ratio(parameters)
+
+    def test_priors_fixed_and_listed(self):
+        marginalized = {"ra", "dec", "psi", "phase", "geocent_time", "luminosity_distance"}
+        self.assertEqual(set(self.likelihood._marginalized_parameters), marginalized)
+        for key in marginalized:
+            self.assertIsInstance(self.priors[key], float, key)  # a fixed value, as bilby's distance marginalization
+        # the likelihood keeps the priors themselves, for the time prior and the distance table
+        self.assertIsInstance(self.likelihood.priors["geocent_time"], bilby.core.prior.Uniform)
+
+    def test_wrong_priors(self):
+        check = bilby.gw.likelihood.ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient._check_extrinsic_priors
+        check(make_priors())
+        for key, prior in [("ra", bilby.core.prior.Uniform(0, np.pi)), ("dec", bilby.core.prior.Uniform(-1, 1)),
+                           ("psi", bilby.core.prior.Uniform(0, 2 * np.pi)), ("phase", bilby.core.prior.Cosine()),
+                           ("geocent_time", bilby.core.prior.Gaussian(GEOCENT_TIME, 0.01))]:
+            priors = make_priors()
+            priors[key] = prior
+            with self.assertRaises(ValueError, msg=key):
+                check(priors)
+        priors = make_priors()
+        del priors["luminosity_distance"]
+        with self.assertRaises(ValueError):
+            check(priors)
+
+    def test_time_prior_term(self):
+        prior = self.likelihood.priors["geocent_time"]
+        start_time = self.interferometers.start_time
+        inside = np.array([prior.minimum, GEOCENT_TIME, prior.maximum - 1e-3]) - start_time
+        np.testing.assert_allclose(self.likelihood._ln_time_prior(inside), -np.log(prior.maximum - prior.minimum))
+        outside = np.array([prior.minimum - 1e-3, prior.maximum + 1e-3]) - start_time
+        self.assertTrue(np.all(self.likelihood._ln_time_prior(outside) == -np.inf))
+
+    def test_matches_the_coherent_score(self):
+        # the class's value is CoherentScore.get_marginalization_info on its own time series and time grid
+        value = self.call_on_sequence(dict(INJECTION), sequence=1)
+        threshold = self.likelihood._max_lnl_marginalized - self.likelihood.dlnl_marginalized_threshold
+        polarizations = self.likelihood.waveform_generator.frequency_domain_strain(
+            self.likelihood._waveform_parameters(INJECTION))
+        d_inner_h, h_inner_h, time_shift = self.likelihood.get_time_series_inner_products(polarizations)
+        score = self.likelihood.coherent_score
+        score.sky_dict.set_generators()
+        score._current_qmc_sequence_id = 0
+        info = score.get_marginalization_info(d_inner_h, h_inner_h, self.likelihood.times - time_shift, threshold)
+        self.assertEqual(value, info.lnl_marginalized)
+        self.assertEqual(self.likelihood.marginalization_info.n_effective, info.n_effective)
+
+    def test_marginalized_values_are_ignored(self):
+        changed = dict(INJECTION, ra=0.1, dec=0.3, psi=2.0, phase=1.0, geocent_time=GEOCENT_TIME + 0.05,
+                       luminosity_distance=300.0)
+        self.assertEqual(self.call_on_sequence(dict(INJECTION), 2), self.call_on_sequence(changed, 2))
+
+    def test_largest_estimate_and_threshold(self):
+        with mock.patch.object(self.likelihood.coherent_score, "get_marginalization_info",
+                               wraps=self.likelihood.coherent_score.get_marginalization_info) as wrapped:
+            largest = self.likelihood._max_lnl_marginalized
+            value = self.call_on_sequence(dict(INJECTION), 3)
+        self.assertEqual(wrapped.call_args.kwargs["lnl_marginalized_threshold"],
+                         largest - self.likelihood.dlnl_marginalized_threshold)
+        self.assertEqual(self.likelihood._max_lnl_marginalized, max(largest, value))
+
+    def test_reject(self):
+        likelihood = self.likelihood
+        largest = likelihood._max_lnl_marginalized
+        self.assertTrue(likelihood.reject(SimpleNamespace(n_effective=1.5, lnl_marginalized=largest - 10)))
+        self.assertTrue(likelihood.reject(SimpleNamespace(n_effective=5, lnl_marginalized=largest + 1)))
+        self.assertFalse(likelihood.reject(SimpleNamespace(n_effective=5, lnl_marginalized=largest - 1)))
+        self.assertFalse(likelihood.reject(SimpleNamespace(n_effective=20, lnl_marginalized=largest + 1)))
+
+    def test_rejection_returns_the_most_negative_float(self):
+        likelihood = self.likelihood
+        before = likelihood.number_of_rejections
+        with mock.patch.object(likelihood, "reject", return_value=True), \
+                self.assertLogs("bilby", level=logging.WARNING):
+            likelihood.number_of_rejections = 0  # the first rejection is logged
+            self.assertEqual(self.call_on_sequence(dict(INJECTION), 0), np.nan_to_num(-np.inf))
+        self.assertEqual(likelihood.number_of_rejections, 1)
+        likelihood.number_of_rejections = before
+        likelihood.reject_low_n_effective = False
+        try:
+            with mock.patch.object(likelihood, "reject", return_value=True):
+                self.assertGreater(self.call_on_sequence(dict(INJECTION), 0), 0)
+        finally:
+            likelihood.reject_low_n_effective = True
+
+    def test_posterior_samples_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            self.likelihood.generate_posterior_sample_from_marginalized_likelihood(dict(INJECTION))
+
+    def test_beta_tuned_on_construction(self):
+        likelihood, _ = make_likelihood(optimize_beta_temperature=True,
+                                        coherent_score_kwargs=dict(n_qmc_sequences=2))
+        self.assertEqual(likelihood.coherent_score.beta_temperature.shape, (2,))
+        self.assertTrue(np.all((likelihood.coherent_score.beta_temperature >= 0.1)
+                               & (likelihood.coherent_score.beta_temperature <= 1)))
+        self.assertGreater(likelihood._max_lnl_marginalized, -np.inf)
 
 
 if __name__ == "__main__":
