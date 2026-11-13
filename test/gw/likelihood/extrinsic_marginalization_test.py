@@ -811,9 +811,57 @@ class TestLikelihoodClass(unittest.TestCase):
         finally:
             likelihood.reject_low_n_effective = True
 
-    def test_posterior_samples_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            self.likelihood.generate_posterior_sample_from_marginalized_likelihood(dict(INJECTION))
+    def test_drawn_samples_reproduce_their_likelihood(self):
+        # bilby's unbinned likelihood at a drawn sample's sky location, time, polarization and phase, at one distance,
+        # equals the log likelihood the marginalization holds for that sample: the conversions are consistent
+        full = bilby.gw.likelihood.GravitationalWaveTransient(
+            self.interferometers, make_waveform_generator(bilby.gw.source.lal_binary_black_hole))
+        self.call_on_sequence(dict(INJECTION), 1)
+        drawn = self.likelihood.coherent_score.draw_posterior_samples(
+            self.likelihood.marginalization_info, 8, np.random.default_rng(1))
+        gmst = greenwich_mean_sidereal_time(self.likelihood.reference_gps_time)
+        distance = 1500.0
+        ratio = distance / self.likelihood._ref_dist
+        for i in range(8):
+            parameters = dict(INJECTION, ra=(drawn["lon"][i] + gmst) % (2 * np.pi), dec=drawn["lat"][i],
+                              psi=drawn["psi"][i], phase=drawn["phase"][i],
+                              geocent_time=self.interferometers.start_time + drawn["t_geocenter"][i],
+                              luminosity_distance=distance)
+            expected = drawn["d_h"][i] / ratio - drawn["h_h"][i] / ratio ** 2 / 2
+            self.assertAlmostEqual(full.log_likelihood_ratio(parameters), expected, delta=0.02)
+
+    def test_generate_posterior_sample(self):
+        bilby.core.utils.random.seed(4)
+        sample = self.likelihood.generate_posterior_sample_from_marginalized_likelihood(dict(INJECTION))
+        prior = self.likelihood.priors["geocent_time"]
+        for key in self.likelihood._marginalized_parameters:
+            self.assertTrue(np.isfinite(sample[key]), key)
+        self.assertTrue(0 <= sample["ra"] < 2 * np.pi)
+        self.assertTrue(-np.pi / 2 <= sample["dec"] <= np.pi / 2)
+        self.assertTrue(0 <= sample["psi"] < np.pi)
+        self.assertTrue(0 <= sample["phase"] < 2 * np.pi)
+        self.assertTrue(prior.minimum <= sample["geocent_time"] <= prior.maximum)
+        distance_prior = self.likelihood.priors["luminosity_distance"]
+        self.assertTrue(distance_prior.minimum <= sample["luminosity_distance"] <= distance_prior.maximum)
+        self.assertEqual(sample["chirp_mass"], INJECTION["chirp_mass"])
+
+    def test_flip_psi(self):
+        self.call_on_sequence(dict(INJECTION), 2)
+        info = deepcopy(self.likelihood.marginalization_info)
+        info.flip_psi = np.ones_like(info.flip_psi, dtype=bool)
+        score = self.likelihood.coherent_score
+        flipped = score.draw_posterior_samples(info, 20, np.random.default_rng(5), flip_psi=True)
+        plain = score.draw_posterior_samples(info, 20, np.random.default_rng(5), flip_psi=False)
+        np.testing.assert_allclose(flipped["psi"], (plain["psi"] + np.pi / 2) % np.pi)
+        np.testing.assert_allclose(flipped["d_h"], -plain["d_h"])
+        for key in ["lat", "lon", "phase", "t_geocenter", "h_h"]:
+            np.testing.assert_array_equal(flipped[key], plain[key])
+
+    def test_no_kept_pair_gives_nan(self):
+        info = deepcopy(self.likelihood.marginalization_info)
+        info.q_inds = np.array([], int)
+        drawn = self.likelihood.coherent_score.draw_posterior_samples(info, 3, np.random.default_rng(0))
+        self.assertTrue(all(np.all(np.isnan(value)) for value in drawn.values()))
 
     def test_beta_tuned_on_construction(self):
         likelihood, _ = make_likelihood(optimize_beta_temperature=True,

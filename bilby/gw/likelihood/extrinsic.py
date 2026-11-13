@@ -4,7 +4,9 @@ import numpy as np
 
 from .coherent_score import CoherentScore, SkyDictionary
 from .relative_modes import ModeByModeRelativeBinningGravitationalWaveTransient
-from ...core.prior import Cosine, Uniform
+from ...core.prior import Cosine, Interped, Uniform
+from ...core.utils import random
+from ..time import greenwich_mean_sidereal_time
 from ...core.utils import logger, radius_of_earth, speed_of_light
 
 # The extrinsic parameters marginalized by the class besides the distance, and the prior each must have: the sky
@@ -115,6 +117,12 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         :code:`nphi`, :code:`log2n_qmc`, :code:`max_log2n_qmc`,
         :code:`n_qmc_sequences`, :code:`min_n_effective`,
         :code:`learning_rate`, :code:`beta_temperature` and :code:`seed`.
+    flip_psi: bool, optional
+        Whether a drawn extrinsic sample whose
+        :math:`\\langle d|h\\rangle` is negative is returned with its
+        polarization increased by pi/2, as cogwheel (arXiv:2404.02435 Sec.
+        A7); see :code:`CoherentScore.draw_posterior_samples`. Default is
+        :code:`True`.
     sky_dictionary_kwargs: dict, optional
         Keyword arguments of :code:`SkyDictionary`, such as :code:`nsky`
         and :code:`seed`; :code:`f_sampling` defaults to the multiple of the
@@ -141,7 +149,9 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
                  dlnl_marginalized_threshold=30.,
                  optimize_beta_temperature=True,
                  coherent_score_kwargs=None,
-                 sky_dictionary_kwargs=None):
+                 sky_dictionary_kwargs=None,
+                 flip_psi=True):
+        self.flip_psi = flip_psi
         self._check_extrinsic_priors(priors)
         self.dlnl_threshold = dlnl_threshold
         self.reject_low_n_effective = reject_low_n_effective
@@ -280,10 +290,65 @@ class ExtrinsicMarginalizedRelativeBinningGravitationalWaveTransient(
         self._max_lnl_marginalized = max(self._max_lnl_marginalized, info.lnl_marginalized)
         return float(info.lnl_marginalized)
 
+    @property
+    def reference_gps_time(self):
+        """
+        The GPS time at which Earth-fixed longitude is turned into right
+        ascension: the centre of the :code:`geocent_time` prior. The antenna
+        patterns and delays are those of Earth-fixed coordinates, so the
+        rotation of the Earth within the prior is neglected, as cogwheel.
+        """
+        prior = self.priors["geocent_time"]
+        return (prior.minimum + prior.maximum) / 2
+
     def generate_posterior_sample_from_marginalized_likelihood(self, parameters):
-        """Not implemented yet: drawing the marginalized parameters is block 9 of the port."""
-        raise NotImplementedError(
-            "Drawing the marginalized extrinsic parameters is not implemented yet.")
+        """
+        Draw the six marginalized parameters from their posterior
+        conditional on the other parameters, as cogwheel's
+        :code:`MarginalizedExtrinsicLikelihood.get_blob`: the likelihood is
+        evaluated again (:code:`log_likelihood_ratio`, with its side effects),
+        one kept (sample, phase) pair of the estimate is drawn with
+        probability equal to its normalized weight
+        (:code:`CoherentScore.draw_posterior_samples`), and its distance is
+        drawn from the likelihood times the distance prior on the grid of
+        the distance lookup table. The right ascension is the Earth-fixed
+        longitude plus the Greenwich mean sidereal time at
+        :code:`reference_gps_time`, and the declination is the latitude.
+        Random numbers come from :code:`bilby.core.utils.random`, which bilby
+        seeds for each sample.
+
+        Returns
+        -------
+        dict
+            :code:`parameters` with :code:`ra`, :code:`dec`, :code:`psi`,
+            :code:`phase`, :code:`geocent_time` and
+            :code:`luminosity_distance` replaced; NaN if the estimate kept no
+            pair.
+        """
+        self.log_likelihood_ratio(parameters)
+        return self.sample_from_marginalization_info(parameters, self.marginalization_info, self.flip_psi)
+
+    def sample_from_marginalization_info(self, parameters, marginalization_info, flip_psi):
+        """
+        The second part of :code:`generate_posterior_sample_from_marginalized_likelihood`: draw the six
+        marginalized parameters from a given estimate, with or without the polarization flip, using
+        :code:`bilby.core.utils.random`.
+        """
+        parameters = copy.deepcopy(dict(parameters))
+        sample = self.coherent_score.draw_posterior_samples(marginalization_info, 1, random.rng, flip_psi=flip_psi)
+        sample = {key: value[0] for key, value in sample.items()}
+        if np.isnan(sample["d_h"]):
+            parameters.update(dict.fromkeys(_MARGINALIZED_PRIORS, np.nan), luminosity_distance=np.nan)
+            return parameters
+        ratio = self._ref_dist / self._distance_array
+        distance_log_like = sample["d_h"] * ratio - sample["h_h"] * ratio ** 2 / 2
+        distance_posterior = np.exp(distance_log_like - np.max(distance_log_like)) * self.distance_prior_array
+        parameters.update(
+            ra=float((sample["lon"] + greenwich_mean_sidereal_time(self.reference_gps_time)) % (2 * np.pi)),
+            dec=float(sample["lat"]), psi=float(sample["psi"]), phase=float(sample["phase"]),
+            geocent_time=float(self.interferometers.start_time + sample["t_geocenter"]),
+            luminosity_distance=float(Interped(self._distance_array, distance_posterior).sample()))
+        return parameters
 
     @staticmethod
     def _get_time_grid(interferometers, priors, waveform_generator, time_padding=None):

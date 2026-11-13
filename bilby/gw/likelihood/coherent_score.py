@@ -1091,3 +1091,56 @@ class CoherentScore:
         finally:
             self.beta_temperature, self.min_n_effective = saved
         self.beta_temperature = beta_temperature
+
+    def draw_posterior_samples(self, marginalization_info, num, rng, flip_psi=True):
+        """
+        Draw extrinsic samples from the conditional posterior that a
+        marginalization estimated, as cogwheel's
+        :code:`CoherentScoreHM.gen_samples_from_marg_info` without the
+        distance: each sample is a kept (sample, phase) pair chosen with
+        probability equal to its normalized importance weight.
+
+        Parameters
+        ----------
+        marginalization_info: MarginalizationInfo
+            From :code:`get_marginalization_info`.
+        num: int
+            Number of samples.
+        rng: numpy.random.Generator
+            The random generator.
+        flip_psi: bool, optional
+            Whether a pair with :math:`\\langle d|h\\rangle < 0` is returned
+            with its polarization increased by pi/2 (modulo pi) and the sign
+            of :math:`\\langle d|h\\rangle` reversed, as cogwheel
+            (arXiv:2404.02435 Sec. A7). The antenna patterns change sign under
+            that shift, so the pair's waveform changes sign. Default is
+            :code:`True`, as cogwheel.
+
+        Returns
+        -------
+        dict
+            Arrays of length :code:`num`: :code:`lat` and :code:`lon`, the
+            Earth-fixed latitude and longitude (rad); :code:`psi` (rad);
+            :code:`phase`, the orbital phase of the pair (rad);
+            :code:`t_geocenter`, the geocentric arrival time on the scale of
+            the time grid (s); :code:`d_h` and :code:`h_h`, the real inner
+            products of the pair at the distance the waveform was generated
+            at, :code:`d_h` after the flip. All are NaN if no pair is kept.
+        """
+        info = marginalization_info
+        keys = ["lat", "lon", "psi", "phase", "t_geocenter", "d_h", "h_h"]
+        if info.q_inds.size == 0:
+            return {key: np.full(num, np.nan) for key in keys}
+        chosen = rng.choice(len(info.q_inds), size=num, p=info.weights)
+        q_inds, sky_inds = info.q_inds[chosen], info.sky_inds[chosen]
+        psi = self._qmc_sequences[info.qmc_sequence_id]["psi"][q_inds]
+        d_h = info.d_h[chosen].astype(float)
+        if flip_psi:
+            flipped = info.flip_psi[chosen]
+            psi = np.where(flipped, (psi + np.pi / 2) % np.pi, psi)
+            d_h = np.where(flipped, -d_h, d_h)
+        return dict(
+            lat=self.sky_dict.sky_samples["lat"][sky_inds], lon=self.sky_dict.sky_samples["lon"][sky_inds],
+            psi=psi, phase=self.phi_ref[info.o_inds[chosen]],
+            t_geocenter=info.t_first_det[chosen] - self.sky_dict.geocenter_delay_first_det[sky_inds],
+            d_h=d_h, h_h=info.h_h[chosen].astype(float))
